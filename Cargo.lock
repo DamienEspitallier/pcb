@@ -4698,6 +4698,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcb-schematic"
+version = "0.4.4"
+dependencies = [
+ "anyhow",
+ "insta",
+ "log",
+ "natord",
+ "pcb-sch",
+ "pcb-sexpr",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "pcb-sexpr"
 version = "0.4.4"
 dependencies = [
@@ -4915,6 +4930,7 @@ dependencies = [
  "pcb-kicad",
  "pcb-layout",
  "pcb-sch",
+ "pcb-schematic",
  "pcb-sexpr",
  "pcb-sim",
  "pcb-test-utils",

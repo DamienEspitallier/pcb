@@ -39,6 +39,7 @@ mod release;
 mod remote_sandbox;
 mod route;
 mod sandbox_uri;
+mod sch;
 mod sim;
 mod test;
 mod update;
@@ -157,6 +158,9 @@ enum Commands {
     #[command(hide = true)]
     Route(route::RouteArgs),
 
+    /// Generate KiCad schematics from .zen files
+    Sch(sch::SchArgs),
+
     /// Run SPICE simulations
     #[command(alias = "sim", alias = "s")]
     Simulate(sim::SimArgs),
@@ -240,6 +244,7 @@ fn run() -> anyhow::Result<()> {
         Commands::Search(args) => pcb_diode_api::execute_search(args),
         Commands::EmbedStep(args) => embed_step::execute(args),
         Commands::Route(args) => route::execute(args),
+        Commands::Sch(args) => sch::execute(args),
         Commands::Simulate(args) => sim::execute(args),
         Commands::Ipc2581(args) => ipc2581::execute(args),
         Commands::Gerber(args) => gerber::execute(args),

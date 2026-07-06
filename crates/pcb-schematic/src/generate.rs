@@ -264,7 +264,8 @@ mod tests {
     use super::*;
     use crate::model::ATTR_SYMBOL_VALUE;
     use crate::testkit::{
-        analog_filter, decoupled_adc, diff_filter, digital_bus, divider, hierarchical_design,
+        adc_dout_congested, analog_filter, decoupled_adc, diff_filter, digital_bus, divider,
+        hierarchical_design, split_rail_ic,
     };
 
     /// X coordinate of a placed component symbol, found by its refdes. Reads the
@@ -403,6 +404,85 @@ mod tests {
             1,
             "two adjacent GND pins of one IC must share a single symbol"
         );
+    }
+
+    #[test]
+    fn merged_rail_bank_symbol_is_lifted_one_grid_step() {
+        // Rule #2. A split VDD rail (two pins separated by two foreign pins on
+        // one IC edge, the AD7171 REFIN+/VDD pattern) is crowned by ONE rail
+        // symbol under a short offset bus (`merge_power_banks`). That symbol is
+        // lifted one grid step higher than the bare two-step power stub, so the
+        // arrow crowning the whole pin column rides on a full harmonized channel
+        // above its topmost tap — the engineer's "raise the VDD that climbs off
+        // REFIN+/VDD by one step".
+        let mut opts = SchOptions::new("sr");
+        opts.config.relegate_utility = false;
+        let out = generate_schematic(&split_rail_ic(), &opts).unwrap();
+        let c = &out.files[0].content;
+        let vdd: Vec<_> = power_symbols(c)
+            .into_iter()
+            .filter(|s| s.0 == "VDD")
+            .collect();
+        assert_eq!(
+            vdd.len(),
+            1,
+            "the split rail merges under a single VDD symbol"
+        );
+        let (_, sx, sy, _) = vdd[0];
+        // Taps: horizontal wires into the bus column — one endpoint on the bus
+        // (the symbol's X), the other on the pin side (a lower X). The topmost
+        // is the highest served pin.
+        let top = wire_segments(c)
+            .into_iter()
+            .filter(|(a, b)| (a.1 - b.1).abs() < 1e-6) // horizontal only
+            .filter_map(|(a, b)| {
+                let (bus, pin) = if (a.0 - sx).abs() < 1e-6 {
+                    (a, b)
+                } else if (b.0 - sx).abs() < 1e-6 {
+                    (b, a)
+                } else {
+                    return None;
+                };
+                (pin.0 < bus.0 - 1e-6).then_some(bus.1) // pin side sits left of the bus
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(top.is_finite(), "found the rail taps into the bus column");
+        let cfg = SchConfig::default();
+        let plain = top - cfg.power_stub_mm; // where a bare two-step stub lands
+        assert!(
+            (sy - (plain - cfg.grid_mm)).abs() < 1e-6,
+            "VDD bank symbol at y={sy}; expected {} (topmost tap {top} - stub - one grid step)",
+            plain - cfg.grid_mm
+        );
+        assert!(
+            sy < plain - 1e-6,
+            "the merged rail symbol sits strictly above the plain two-step stub (the lift)"
+        );
+    }
+
+    #[test]
+    fn crowded_pullup_signal_promotes_to_a_global_label() {
+        // Rule #3. A two-endpoint signal net whose IC-pin local label would be
+        // cramped — boxed in on a crowded IC edge so its only fallback collides
+        // with a neighbouring net — promotes to a self-contained global label
+        // for BOTH endpoints (the AD7171 SPI_MISO on DOUT/RDY, wedged between
+        // AIN- and its filter column). Net names are unique, so this is a pure
+        // label-style change: the connectivity is unchanged.
+        let out = generate_schematic(&adc_dout_congested(), &SchOptions::new("dout")).unwrap();
+        let c = &out.files[0].content;
+        let globals = c.matches("(global_label \"MISO\"").count();
+        let locals = c.matches("(label \"MISO\"").count(); // excludes "(global_label"
+        assert_eq!(
+            locals, 0,
+            "the cramped DOUT signal carries no floating local label"
+        );
+        assert_eq!(
+            globals, 2,
+            "both MISO endpoints read as global-label hexagons instead"
+        );
+        // Determinism guard: the promotion is stable across generations.
+        let again = generate_schematic(&adc_dout_congested(), &SchOptions::new("dout")).unwrap();
+        assert_eq!(c, &again.files[0].content);
     }
 
     #[test]

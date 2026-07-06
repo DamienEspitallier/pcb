@@ -748,6 +748,61 @@ impl<'a> Router<'a> {
         true
     }
 
+    /// Does this candidate path keep at least `min_net_spacing_steps` grid
+    /// steps clear of every PARALLEL foreign-net wire already committed? Two
+    /// same-orientation segments of different nets that overlap along their
+    /// shared axis must sit at least that far apart on the perpendicular axis
+    /// — the engineer's "two grid steps between nets by default, like out of
+    /// power" rule, so parallel columns/rows read on one harmonized grid
+    /// instead of hugging each other at a single step. Perpendicular (frank)
+    /// crossings are untouched: they are electrically harmless and handled by
+    /// the crossing-penalty pass. A zero perpendicular offset (collinear,
+    /// same-axis overlap) is a forbidden contact handled by `path_ok`, not
+    /// here. Disabled when the knob is zero.
+    pub(crate) fn parallel_clear(&self, points: &[Point], net: &str) -> bool {
+        let min_spacing = self.cfg.min_net_spacing_mm();
+        if min_spacing <= EPS {
+            return true;
+        }
+        for w in points.windows(2) {
+            if dist(w[0], w[1]) < EPS {
+                continue;
+            }
+            let s_h = (w[0].1 - w[1].1).abs() < EPS;
+            for other in &self.reg.segs {
+                if other.net == net {
+                    continue;
+                }
+                let o_h = (other.y1 - other.y2).abs() < EPS;
+                if s_h != o_h {
+                    continue; // perpendicular: not a parallel run
+                }
+                if s_h {
+                    let dy = (w[0].1 - other.y1).abs();
+                    if dy < EPS || dy >= min_spacing - EPS {
+                        continue;
+                    }
+                    let lo = w[0].0.min(w[1].0).max(other.x1.min(other.x2));
+                    let hi = w[0].0.max(w[1].0).min(other.x1.max(other.x2));
+                    if lo < hi - EPS {
+                        return false;
+                    }
+                } else {
+                    let dx = (w[0].0 - other.x1).abs();
+                    if dx < EPS || dx >= min_spacing - EPS {
+                        continue;
+                    }
+                    let lo = w[0].1.min(w[1].1).max(other.y1.min(other.y2));
+                    let hi = w[0].1.max(w[1].1).min(other.y1.max(other.y2));
+                    if lo < hi - EPS {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// May a label text live here without covering anything foreign?
     /// `strict` also rejects overlap with same-net texts (two homonym
     /// stacked labels read as one and hide the second wire).
@@ -886,6 +941,26 @@ impl<'a> Router<'a> {
         if rest.is_empty() {
             return;
         }
+        // Promote a small root-sheet net to GLOBAL labels when a local label on
+        // one of its endpoints would collide — no clean placement exists and
+        // the short off-the-end fallback lands on a foreign net. A global label
+        // is a self-contained hexagon centred on the pin row, so it fits a
+        // crowded IC edge where floating local text cannot (the engineer's
+        // AD7171 SPI_MISO on DOUT/RDY, boxed between AIN- and its own filter
+        // column at the 2-step pin pitch — the reference layout draws it global
+        // too). The scope is deliberately tight: only a point-to-point net (two
+        // endpoints), where every endpoint reads cleanly as the same global net
+        // — a widely fanned bus keeps its distributed local labels, one cramped
+        // tap not being worth flipping the whole net. Net names are unique per
+        // design, so a name only connects to its own net: the promotion is a
+        // pure label-style change, never a netlist change. Confined to the root
+        // sheet (the design boundary); sub-sheet port nets keep the
+        // hierarchical-label anchor + local-homonym mechanism.
+        let cramped = is_root
+            && port.is_none()
+            && self.model.nets[sn].design_endpoints == 2
+            && rest.iter().any(|ep| self.local_label_collides(&name, ep));
+        let use_global = single || cramped;
         if let Some(direction) = port
             && !is_root
             && !self.port_anchored.contains(&name)
@@ -894,8 +969,53 @@ impl<'a> Router<'a> {
             rest.retain(|e| quant(e.pos) != quant(anchored.pos));
         }
         for ep in rest {
-            self.emit_label_stub(&name, &ep, single);
+            self.emit_label_stub(&name, &ep, use_global);
         }
+    }
+
+    /// Would a LOCAL label on this endpoint be forced onto the short
+    /// off-the-end fallback AND land on top of a foreign net there? Read-only
+    /// mirror of the placement search in `emit_label_stub`. It returns true
+    /// only for a genuinely *bad* cramp: no clean placement exists (no
+    /// crossing-free straight stub for a horizontal pin, no routable elbow for
+    /// a vertical one) AND the fallback the emitter would then commit overlaps
+    /// a foreign net's wire/label/symbol. A hub's signal label that simply
+    /// reads outward into open air is NOT flagged — its short stub is by
+    /// design. This is the AD7171 SPI_MISO on DOUT/RDY, whose only fallback
+    /// jams its text across the AIN- filter column: such a net is better as a
+    /// self-contained global-label hexagon.
+    fn local_label_collides(&self, name: &str, ep: &Endpoint) -> bool {
+        let cfg = self.cfg;
+        if ep.dir.1.abs() > 0.5 {
+            let stub0 = cfg.stub_mm + 2.54;
+            let elbow0 = cfg.label_elbow_mm.max(label_text_width(name));
+            for stub in [stub0, stub0 + 2.54, cfg.stub_mm] {
+                for side in [1.0, -1.0] {
+                    for elbow in [elbow0, elbow0 + 2.54] {
+                        let knee = (ep.pos.0, round4(ep.pos.1 + ep.dir.1 * stub));
+                        let end = (round4(knee.0 + side * cfg.snap_up(elbow)), knee.1);
+                        if self.path_ok(&[ep.pos, knee, end], name, &[ep.placed]) {
+                            return false; // a clean elbow placement exists
+                        }
+                    }
+                }
+            }
+            // Vertical fallback: short straight stub, horizontal label (rot 0).
+            let end = (ep.pos.0, round4(ep.pos.1 + ep.dir.1 * 2.54));
+            return !self.label_box_clear(&label_text_box(name, end, 0), name, false);
+        }
+        let base = label_stub_len(cfg, name);
+        for extra in [0.0, 2.54, 5.08, 7.62, 10.16, 12.7] {
+            let end = (round4(ep.pos.0 + ep.dir.0 * (base + extra)), ep.pos.1);
+            let path = vec![ep.pos, end];
+            if self.path_ok(&path, name, &[ep.placed]) && self.reg.count_crossings(&path) == 0 {
+                return false; // a clean straight-stub placement exists
+            }
+        }
+        // Horizontal fallback: short off-the-end stub, label reading outward.
+        let end = (round4(ep.pos.0 + ep.dir.0 * 2.54), ep.pos.1);
+        let rot = if ep.dir.0 >= 0.0 { 0 } else { 180 };
+        !self.label_box_clear(&label_text_box(name, end, rot), name, false)
     }
 
     /// Stub + horizontal net label on a pin (name equality connects).
@@ -1263,12 +1383,20 @@ impl<'a> Router<'a> {
             let ymin = eps[members[0]].pos.1;
             let ymax = eps[*members.last().unwrap()].pos.1;
             let placed_excl: Vec<usize> = members.iter().map(|&i| eps[i].placed).collect();
+            // A merged rail bank lifts its symbol one grid step higher than the
+            // bare power stub: the arrow crowns a whole pin column (its bus taps
+            // several pins), so it wants a full harmonized channel — two steps
+            // of exit plus a step of air — above the topmost tap instead of
+            // hugging it at the plain two-step stub. Grounds keep the plain stub
+            // (their glyph hangs below, into open space). The engineer's "raise
+            // the VDD that climbs off REFIN+/VDD by one step" on AD7171.
+            let rail_lift = self.cfg.grid_mm;
             for step in 0..=8 {
                 let bus_x = round4(px + dirx as f64 * (base_off + step as f64 * g));
                 let sym_y = if down {
                     round4(ymax + stub)
                 } else {
-                    round4(ymin - stub)
+                    round4(ymin - stub - rail_lift)
                 };
                 let (bus_top, bus_bot) = if down { (ymin, sym_y) } else { (sym_y, ymax) };
                 let bus = vec![(bus_x, bus_top), (bus_x, bus_bot)];
@@ -1279,7 +1407,11 @@ impl<'a> Router<'a> {
                 segs.push(bus.clone());
                 let gbox = power_symbol_graphic_box(name, (bus_x, sym_y), down);
                 let clean = segs.iter().all(|s| self.path_ok(s, name, &placed_excl))
-                    && self.graphic_box_clear(&gbox, name);
+                    && self.graphic_box_clear(&gbox, name)
+                    // Rule #1: the bus column stands off every neighbouring net
+                    // by the harmonized inter-net channel (two grid steps),
+                    // never hugging a foreign wire at a single step.
+                    && segs.iter().all(|s| self.parallel_clear(s, name));
                 if !clean {
                     continue;
                 }

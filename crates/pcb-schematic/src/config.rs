@@ -80,6 +80,15 @@ pub struct SchConfig {
     /// schematic free of right angles struck right at a pin (the engineer's
     /// "at least two grid steps out of every pin" rule).
     pub min_pin_exit_steps: usize,
+    /// Minimum spacing, in grid steps, kept between two parallel wires (or a
+    /// net label's text) of DIFFERENT nets. Harmonizes the whole sheet on the
+    /// same coarse pitch the power exits already use (the engineer's "two grid
+    /// steps between nets by default, like out of power" rule): a power-bus
+    /// column peels off two steps clear of the neighbouring net instead of
+    /// hugging it at one, and a foreign net label keeps two steps of air from
+    /// a parallel wire. Matches `min_pin_exit_steps` so the pin exit and the
+    /// inter-net channel read as one grid.
+    pub min_net_spacing_steps: usize,
     /// Power stub length (pin end to power symbol).
     pub power_stub_mm: f64,
     /// Power symbol row alignment: two stubs of the same net whose symbols
@@ -210,6 +219,7 @@ impl Default for SchConfig {
             role_row_gap_mm: 19.05,
             stub_mm: 5.08,
             min_pin_exit_steps: 2,
+            min_net_spacing_steps: 2,
             label_stub_min_grid_steps: 4,
             value_gap_grid_steps: 1,
             ref_gap_grid_steps: 1,
@@ -265,6 +275,13 @@ impl SchConfig {
     /// grid steps). A pin's first bend must sit at least this far from the pin.
     pub fn min_pin_exit_mm(&self) -> f64 {
         crate::round4(self.min_pin_exit_steps as f64 * self.grid_mm)
+    }
+
+    /// Minimum inter-net spacing in millimeters (`min_net_spacing_steps` grid
+    /// steps). Two parallel wires of different nets, or a foreign net label and
+    /// a wire, stay at least this far apart.
+    pub fn min_net_spacing_mm(&self) -> f64 {
+        crate::round4(self.min_net_spacing_steps as f64 * self.grid_mm)
     }
 }
 
@@ -326,6 +343,14 @@ mod tests {
         let pe: SchConfig = toml_str_subset("min-pin-exit-steps = 3\n");
         assert_eq!(pe.min_pin_exit_steps, 3);
         assert_eq!(pe.min_pin_exit_mm(), 3.81);
+        // Inter-net spacing knob, kebab-case, defaulted and overridable. Its
+        // default matches the pin-exit guard (two grid steps) so the sheet
+        // reads on one harmonized coarse grid.
+        assert_eq!(cfg.min_net_spacing_steps, 2);
+        assert_eq!(cfg.min_net_spacing_mm(), 2.54);
+        let ns: SchConfig = toml_str_subset("min-net-spacing-steps = 3\n");
+        assert_eq!(ns.min_net_spacing_steps, 3);
+        assert_eq!(ns.min_net_spacing_mm(), 3.81);
         // Potential-ordering knob, kebab-case, defaulted and overridable.
         assert!(cfg.align_power_by_potential);
         let ap: SchConfig = toml_str_subset("align-power-by-potential = false\n");

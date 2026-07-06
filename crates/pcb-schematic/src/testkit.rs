@@ -248,6 +248,132 @@ pub fn power_bank() -> Schematic {
     sch
 }
 
+/// The AD7171 input corner: an IC whose left edge stacks AIN+, AIN- and a
+/// DOUT/RDY output at the 2-step pin pitch, with a differential input filter
+/// (series R + shunt C on each of AIN+/AIN-) crowding the edge, plus a pull-up
+/// resistor on the DOUT net. The DOUT net (`MISO`, two endpoints: the IC pin
+/// and the pull-up) is boxed in — a local label on the DOUT pin collides with
+/// the AIN- filter column — so it must promote to a self-contained global
+/// label. Everything lives on the root sheet.
+pub fn adc_dout_congested() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    // Left edge (pads 1..3): AIN+, AIN-, DOUT. Right edge (pads 4..6).
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[
+            ("AINP", "1"),
+            ("AINN", "2"),
+            ("DOUT", "3"),
+            ("GND", "4"),
+            ("VDD", "5"),
+            ("OUT", "6"),
+        ],
+    );
+    let rp = add_r(&mut sch, &["RP"], "6k");
+    let rn = add_r(&mut sch, &["RN"], "6k");
+    let cp = add_c(&mut sch, &["CP"], "100pF");
+    let cn = add_c(&mut sch, &["CN"], "100pF");
+    let rpu = add_r(&mut sch, &["RPU"], "10k");
+    for (n, r) in [
+        ("U1", u1),
+        ("RP", rp),
+        ("RN", rn),
+        ("CP", cp),
+        ("CN", cn),
+        ("RPU", rpu),
+    ] {
+        root_inst.add_child(n.to_string(), r);
+    }
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(Net::new("Net".to_string(), "AINP_EXT", 1).with_port(port_ref(&["RP"], "1")));
+    sch.add_net(Net::new("Net".to_string(), "AINN_EXT", 2).with_port(port_ref(&["RN"], "1")));
+    sch.add_net(
+        Net::new("Net".to_string(), "AINP_FILT", 3)
+            .with_port(port_ref(&["RP"], "2"))
+            .with_port(port_ref(&["CP"], "1"))
+            .with_port(port_ref(&["U1"], "AINP")),
+    );
+    sch.add_net(
+        Net::new("Net".to_string(), "AINN_FILT", 4)
+            .with_port(port_ref(&["RN"], "2"))
+            .with_port(port_ref(&["CN"], "1"))
+            .with_port(port_ref(&["U1"], "AINN")),
+    );
+    // DOUT signal with a pull-up: two endpoints (IC pin + pull-up resistor).
+    sch.add_net(
+        Net::new("Net".to_string(), "MISO", 5)
+            .with_port(port_ref(&["U1"], "DOUT"))
+            .with_port(port_ref(&["RPU"], "1")),
+    );
+    sch.add_net(
+        Net::new("Power".to_string(), "VDD", 6)
+            .with_port(port_ref(&["U1"], "VDD"))
+            .with_port(port_ref(&["RPU"], "2")),
+    );
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 7)
+            .with_port(port_ref(&["U1"], "GND"))
+            .with_port(port_ref(&["CP"], "2"))
+            .with_port(port_ref(&["CN"], "2")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
+/// An IC whose right edge carries a split VDD rail: two VDD pins (pads 5 and 8)
+/// separated by two foreign pins (a ground and a signal), the AD7171
+/// REFIN+/VDD pattern. A single rail symbol crowns both under a short offset
+/// bus (`merge_power_banks`), so this exercises the merged-rail-bank symbol
+/// placement (the one-grid-step lift). GND is undriven; relegation is left to
+/// the caller.
+pub fn split_rail_ic() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    // Pads 1..4 land on the left edge, 5..8 on the right after the box
+    // synthesizer's split. VDD on 5 and 8 (split by GND on 6 and SIG on 7).
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[
+            ("IN1", "1"),
+            ("IN2", "2"),
+            ("IN3", "3"),
+            ("IN4", "4"),
+            ("REFP", "5"),
+            ("REFN", "6"),
+            ("SCK", "7"),
+            ("VDDPIN", "8"),
+        ],
+    );
+    root_inst.add_child("U1".to_string(), u1);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    for (sig, pad) in [
+        ("IN1", 1u64),
+        ("IN2", 2),
+        ("IN3", 3),
+        ("IN4", 4),
+        ("REFN", 6),
+        ("SCK", 7),
+    ] {
+        sch.add_net(Net::new("Net".to_string(), sig, pad).with_port(port_ref(&["U1"], sig)));
+    }
+    sch.add_net(
+        Net::new("Power".to_string(), "VDD", 5)
+            .with_port(port_ref(&["U1"], "REFP"))
+            .with_port(port_ref(&["U1"], "VDDPIN")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
 /// A minimal ADC-like sheet: an IC `U1` (signal input + VDD + GND) with a
 /// rail-to-rail decoupling capacitor `C1` (VDD to GND, 100nF). VDD and GND are
 /// undriven (no `power_out` pin), so each needs a `PWR_FLAG`. Exercises utility

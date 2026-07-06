@@ -45,6 +45,9 @@ pub struct PlacedComp {
     pub group_root: usize,
     pub side: Side,
     pub role: Role,
+    /// Moved out of the functional flow into the right-hand utility band
+    /// (decoupling/bulk relegation). Auto-placed parts only.
+    pub relegated: bool,
     /// Solid box (sheet coordinates), kept in sync with `at`.
     pub bbox: BBox,
     /// Canonical text anchors (filled after the final translation).
@@ -79,6 +82,11 @@ pub struct SheetModel {
     pub pin_net: HashMap<(usize, String), usize>,
     /// Content bounding box after placement (solids included).
     pub content_box: BBox,
+    /// Utility relegation is active on this sheet (it carries a real IC and
+    /// the feature is enabled): decoupling caps were pulled into the right
+    /// band, undriven-rail flags are relegated below them by the router, and
+    /// the functional/decoupling/ERC zones are outlined.
+    pub relegate: bool,
 }
 
 /// Signal-flow categories, left to right.
@@ -273,6 +281,8 @@ struct Engine<'a> {
     nets: Vec<SheetNet>,
     pin_net: HashMap<(usize, String), usize>,
     warnings: &'a mut Vec<String>,
+    /// Set by `run`: this sheet is eligible for utility relegation.
+    relegate: bool,
 }
 
 /// Build and place one sheet.
@@ -307,6 +317,7 @@ pub fn place_sheet(
                 group_root: 0, // resolved in `run`
                 side: Side::default_for(comp.role),
                 role: comp.role,
+                relegated: false,
                 bbox: BBox::EMPTY,
                 ref_at: (0.0, 0.0),
                 value_at: (0.0, 0.0),
@@ -383,17 +394,20 @@ pub fn place_sheet(
         nets,
         pin_net,
         warnings,
+        relegate: false,
     };
     engine.resolve_anchors();
     engine.run(sheet);
 
     let content_box = engine.content_box();
+    let relegate = engine.relegate;
     SheetModel {
         sheet: sheet_idx,
         placed: engine.placed,
         nets: engine.nets,
         pin_net: engine.pin_net,
         content_box,
+        relegate,
     }
 }
 
@@ -454,12 +468,19 @@ impl<'a> Engine<'a> {
                 continue;
             }
             // Passives only become satellites when they touch a rail on one
-            // side (filter/pull pattern); series parts stay in the flow.
+            // side (filter/pull pattern); a series part on signal-only nets
+            // stays in the flow UNLESS it is the terminal element of an
+            // input/output chain feeding an IC (connector/external label ->
+            // passives -> IC pin) — then it rides next to that IC's pin.
             let my_nets: Vec<usize> = self.placed_net_indices(pi);
             let classes: Vec<NetClass> = my_nets.iter().map(|&sn| self.nets[sn].class).collect();
             if role == Role::Passive
                 && !(classes.contains(&NetClass::Ground) || classes.contains(&NetClass::Power))
             {
+                if let Some((ti, side)) = self.input_chain_anchor(pi, &my_nets, &majors) {
+                    self.placed[pi].anchor = Some(ti);
+                    self.placed[pi].side = side;
+                }
                 continue;
             }
 
@@ -517,6 +538,73 @@ impl<'a> Engine<'a> {
                 self.placed[pi].anchor = Some(ti);
             }
         }
+
+        self.chain_shunt_caps();
+    }
+
+    /// Re-parent a shunt/filter capacitor onto the series resistor it filters
+    /// with: a two-pin cap that touches ground and shares its signal node with
+    /// an input-chain resistor rides just below that resistor (IC -> R -> C),
+    /// so the filtered node stays a tight local cluster instead of stretching
+    /// from the IC body down to a flank cap. Decoupling caps across two rails
+    /// (no signal net) are untouched.
+    fn chain_shunt_caps(&mut self) {
+        let n = self.placed.len();
+        for ci in 0..n {
+            if !matches!(self.placed[ci].role, Role::Passive | Role::Decoupling) {
+                continue;
+            }
+            if self.design.comps[self.placed[ci].comp].visible_pins != 2 {
+                continue;
+            }
+            let my = self.placed_net_indices(ci);
+            if !my.iter().any(|&sn| self.nets[sn].class == NetClass::Ground) {
+                continue;
+            }
+            let mut target: Option<usize> = None;
+            for &sn in my
+                .iter()
+                .filter(|&&sn| self.nets[sn].class == NetClass::Signal)
+            {
+                for (opi, _) in &self.nets[sn].endpoints {
+                    if *opi == ci || !self.is_input_chain_resistor(*opi) {
+                        continue;
+                    }
+                    target = Some(match target {
+                        None => *opi,
+                        Some(t) => {
+                            if natord::compare(
+                                &self.design.comps[self.placed[*opi].comp].refdes,
+                                &self.design.comps[self.placed[t].comp].refdes,
+                            )
+                            .is_lt()
+                            {
+                                *opi
+                            } else {
+                                t
+                            }
+                        }
+                    });
+                }
+            }
+            if let Some(r) = target {
+                self.placed[ci].anchor = Some(r);
+                self.placed[ci].side = Side::Below; // shunt hangs down to ground
+            }
+        }
+    }
+
+    /// An input-chain series resistor: a two-pin passive anchored to a part
+    /// while touching signal nets only (the terminal element seated at an IC
+    /// input by [`input_chain_anchor`]).
+    fn is_input_chain_resistor(&self, pi: usize) -> bool {
+        self.placed[pi].role == Role::Passive
+            && self.placed[pi].anchor.is_some()
+            && self.design.comps[self.placed[pi].comp].visible_pins == 2
+            && self
+                .placed_net_indices(pi)
+                .iter()
+                .all(|&sn| self.nets[sn].class == NetClass::Signal)
     }
 
     /// Sheet-net indices touched by a placed component (dedup, pad order).
@@ -539,6 +627,381 @@ impl<'a> Engine<'a> {
             }
         }
         out
+    }
+
+    /// Is this placed component a real multi-pin part (an IC/major worth
+    /// anchoring a satellite to)? A major with at least the configured pin
+    /// count — never a two-pin drawn passive.
+    fn is_ic_major(&self, pi: usize) -> bool {
+        !self.placed[pi].role.is_satellite()
+            && self.placed[pi].role != Role::Crystal
+            && self.design.comps[self.placed[pi].comp].visible_pins >= self.cfg.input_chain_min_pins
+    }
+
+    /// Terminal-chain anchor for a series two-pin passive that only touches
+    /// signal nets. It rides next to the IC it feeds when: one of its nets is
+    /// analog and lands on an IC major (`is_ic_major`), and its OTHER net is
+    /// a genuine chain terminal — it reaches no *other* IC major (a connector
+    /// port, an external label or a shunt to more passives, never an
+    /// IC-to-IC interconnect). Returns the IC and the side its shared pin
+    /// exits on. Deterministic: the IC with the most pins wins, refdes breaks
+    /// ties.
+    fn input_chain_anchor(
+        &self,
+        pi: usize,
+        my_nets: &[usize],
+        majors: &[usize],
+    ) -> Option<(usize, Side)> {
+        let mut best: Option<(usize, usize)> = None; // (major, shared net)
+        for &sn in my_nets {
+            if self.nets[sn].class != NetClass::Signal {
+                continue;
+            }
+            if self.design.nets[self.nets[sn].net].digital {
+                continue; // digital nets ride labels, never a wired satellite
+            }
+            // The passive's OTHER net(s) must not reach a second IC major:
+            // an IC-to-IC series part belongs to the flow, not to a flank.
+            let other_reaches_ic = my_nets.iter().any(|&on| {
+                on != sn
+                    && self.nets[on]
+                        .endpoints
+                        .iter()
+                        .any(|(opi, _)| *opi != pi && self.is_ic_major(*opi))
+            });
+            if other_reaches_ic {
+                continue;
+            }
+            for (opi, _) in &self.nets[sn].endpoints {
+                if *opi == pi || !majors.contains(opi) || !self.is_ic_major(*opi) {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((cur, _)) => {
+                        let a = self.design.comps[self.placed[*opi].comp].visible_pins;
+                        let b = self.design.comps[self.placed[cur].comp].visible_pins;
+                        a > b
+                            || (a == b
+                                && natord::compare(
+                                    &self.design.comps[self.placed[*opi].comp].refdes,
+                                    &self.design.comps[self.placed[cur].comp].refdes,
+                                )
+                                .is_lt())
+                    }
+                };
+                if better {
+                    best = Some((*opi, sn));
+                }
+            }
+        }
+        let (major, sn) = best?;
+        let side = self.major_pin_side(major, sn).unwrap_or(Side::Left);
+        Some((major, side))
+    }
+
+    /// Side of a major on which its pin carrying net `sn` exits, in the
+    /// major's current orientation (used to seat an input-chain satellite on
+    /// the pin it feeds rather than under a default flank).
+    fn major_pin_side(&self, major: usize, sn: usize) -> Option<Side> {
+        let p = &self.placed[major];
+        let geom = &self.design.comps[p.comp].geom;
+        for pin in geom.pins.iter().filter(|pin| !pin.hidden) {
+            if self.pin_net.get(&(major, pin.number.clone())) != Some(&sn) {
+                continue;
+            }
+            let dir = geom.pin_outward(&pin.number, p.rotation, p.mirror)?;
+            return Some(if dir.0 < -0.5 {
+                Side::Left
+            } else if dir.0 > 0.5 {
+                Side::Right
+            } else if dir.1 < -0.5 {
+                Side::Above
+            } else {
+                Side::Below
+            });
+        }
+        None
+    }
+
+    /// Sheet Y of the IC pin that carries one of `r`'s nets (the pin the
+    /// input-chain resistor `r` feeds). Used to order a filter column so the
+    /// short wires never cross.
+    fn ic_pin_y(&self, ic: usize, r: usize) -> Option<f64> {
+        let r_nets = self.placed_net_indices(r);
+        let p = &self.placed[ic];
+        let geom = &self.design.comps[p.comp].geom;
+        for pin in geom.pins.iter().filter(|pin| !pin.hidden) {
+            let Some(&sn) = self.pin_net.get(&(ic, pin.number.clone())) else {
+                continue;
+            };
+            if !r_nets.contains(&sn) {
+                continue;
+            }
+            if let Some(pos) = geom.pin_position(&pin.number, p.at, p.rotation, p.mirror) {
+                return Some(pos.1);
+            }
+        }
+        None
+    }
+
+    /// Shunt capacitors re-parented under a resistor by [`chain_shunt_caps`].
+    fn shunt_caps_of(&self, r: usize) -> Vec<usize> {
+        let mut caps: Vec<usize> = (0..self.placed.len())
+            .filter(|&c| {
+                !self.placed[c].pinned
+                    && self.placed[c].anchor == Some(r)
+                    && matches!(self.placed[c].role, Role::Passive | Role::Decoupling)
+            })
+            .collect();
+        caps.sort_by(|&a, &b| {
+            natord::compare(
+                &self.design.comps[self.placed[a].comp].refdes,
+                &self.design.comps[self.placed[b].comp].refdes,
+            )
+        });
+        caps
+    }
+
+    /// Re-seat input filters into tidy aligned clusters (proximity +
+    /// alignment). Each IC's input-chain resistors stack in one column just
+    /// off the IC's input edge: horizontal resistors on a shared X, ordered by
+    /// the IC pin they feed, each shunt capacitor hanging directly below its
+    /// resistor. The cluster is compact and collision-free by construction.
+    fn tidy_input_filters(&mut self) {
+        let mut by_ic: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for pi in 0..self.placed.len() {
+            if self.placed[pi].pinned || !self.is_input_chain_resistor(pi) {
+                continue;
+            }
+            let Some(a) = self.placed[pi].anchor else {
+                continue;
+            };
+            if self.is_ic_major(a) {
+                by_ic.entry(a).or_default().push(pi);
+            }
+        }
+        for (ic, rs) in by_ic {
+            // Keep only the resistors seated on the dominant horizontal side.
+            let side = self.placed[rs[0]].side;
+            if !matches!(side, Side::Left | Side::Right) {
+                continue;
+            }
+            let mut column: Vec<usize> = rs
+                .into_iter()
+                .filter(|&r| self.placed[r].side == side)
+                .collect();
+            if column.is_empty() {
+                continue;
+            }
+            self.stack_filter_column(ic, &mut column, side);
+        }
+    }
+
+    /// Stack one IC's input filter as a tidy cluster off `side` of the IC: the
+    /// series resistors align on a shared X (horizontal, ordered by the IC pin
+    /// they feed) and every shunt capacitor drops into one aligned row (shared
+    /// Y) below the column, spread across the widened filter zone between the
+    /// column and the IC — the shape the engineer draws for a differential
+    /// input filter. The caps stay on the filtered-node side of the column, so
+    /// their drops never reach the resistors' external stubs (no short) and the
+    /// row reads as one clean bank.
+    fn stack_filter_column(&mut self, ic: usize, rs: &mut [usize], side: Side) {
+        let cfg = self.cfg;
+        // Resistors read horizontal in a vertical column; caps stand upright.
+        for &r in rs.iter() {
+            self.placed[r].rotation = 90;
+            self.placed[r].mirror = None;
+            self.placed[r].bbox = self.solid_box(r);
+            for c in self.shunt_caps_of(r) {
+                self.placed[c].rotation = 0;
+                self.placed[c].mirror = None;
+                self.placed[c].bbox = self.solid_box(c);
+            }
+        }
+        // Order top-to-bottom by the IC pin each resistor feeds.
+        rs.sort_by(|&a, &b| {
+            let ya = self.ic_pin_y(ic, a).unwrap_or(f64::MAX);
+            let yb = self.ic_pin_y(ic, b).unwrap_or(f64::MAX);
+            ya.partial_cmp(&yb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    natord::compare(
+                        &self.design.comps[self.placed[a].comp].refdes,
+                        &self.design.comps[self.placed[b].comp].refdes,
+                    )
+                })
+        });
+        let caps: Vec<usize> = rs.iter().flat_map(|&r| self.shunt_caps_of(r)).collect();
+
+        // Widen the gap to the IC so the cap row fits on the node side.
+        let ic_raw = self.raw_box_of(ic);
+        let r_half = rs
+            .iter()
+            .map(|&r| {
+                let b = raw_box(
+                    &self.design.comps[self.placed[r].comp].geom,
+                    (0.0, 0.0),
+                    self.placed[r].rotation,
+                    None,
+                );
+                (b.x2 - b.x1) / 2.0
+            })
+            .fold(0.0f64, f64::max);
+        let c_pitch = caps
+            .iter()
+            .map(|&c| cfg.snap_up((self.placed[c].bbox.x2 - self.placed[c].bbox.x1) + cfg.grid_mm))
+            .fold(0.0f64, f64::max)
+            .max(cfg.satellite_pitch_mm);
+        let cap_span = if caps.len() > 1 {
+            (caps.len() as f64 - 1.0) * c_pitch
+        } else {
+            0.0
+        };
+        // Widen the gap to the IC so the cap row spreads out under the filter
+        // zone: it gives the filtered nets room to run as continuous wires
+        // (a tight gap forces both differential legs onto cramped labels).
+        let gap = if caps.is_empty() {
+            cfg.satellite_gap_mm
+        } else {
+            cfg.snap_up(2.0 * cfg.satellite_gap_mm + cap_span)
+        };
+        let colx = match side {
+            Side::Left => cfg.snap(ic_raw.x1 - gap - r_half),
+            _ => cfg.snap(ic_raw.x2 + gap + r_half),
+        };
+
+        // Resistor column: tight uniform pitch, centered on the fed IC pins.
+        let r_pitch = rs
+            .iter()
+            .map(|&r| cfg.snap_up((self.placed[r].bbox.y2 - self.placed[r].bbox.y1) + cfg.grid_mm))
+            .fold(0.0f64, f64::max);
+        let avg_pin_y = {
+            let ys: Vec<f64> = rs.iter().filter_map(|&r| self.ic_pin_y(ic, r)).collect();
+            if ys.is_empty() {
+                self.placed[ic].at.1
+            } else {
+                ys.iter().sum::<f64>() / ys.len() as f64
+            }
+        };
+        let top = cfg.snap(avg_pin_y - r_pitch * (rs.len() as f64 - 1.0) / 2.0);
+        let mut col_bottom = f64::NEG_INFINITY;
+        for (i, &r) in rs.iter().enumerate() {
+            let ry = round4(top + i as f64 * r_pitch);
+            let rb = self.placed[r].bbox;
+            let dy = cfg.snap(ry - (rb.y1 + rb.y2) / 2.0);
+            self.placed[r].at = (colx, round4(self.placed[r].at.1 + dy));
+            self.placed[r].bbox = self.solid_box(r);
+            col_bottom = col_bottom.max(self.placed[r].bbox.y2);
+        }
+        if caps.is_empty() {
+            return;
+        }
+
+        // Cap row: aligned Y below the column and below the IC body, spread
+        // across the filter zone on the node side of the resistors.
+        let c_half = caps
+            .iter()
+            .map(|&c| (self.placed[c].bbox.y2 - self.placed[c].bbox.y1) / 2.0)
+            .fold(0.0f64, f64::max);
+        let row_y = cfg.snap(col_bottom.max(ic_raw.y2) + cfg.satellite_gap_mm + c_half);
+        let start_x = match side {
+            Side::Left => cfg.snap(colx + r_half + cfg.satellite_gap_mm),
+            _ => cfg.snap(colx - r_half - cfg.satellite_gap_mm - cap_span),
+        };
+        for (i, &c) in caps.iter().enumerate() {
+            let cx = round4(start_x + i as f64 * c_pitch);
+            let cb = self.placed[c].bbox;
+            let dx = cfg.snap(cx - (cb.x1 + cb.x2) / 2.0);
+            let dy = cfg.snap(row_y - (cb.y1 + cb.y2) / 2.0);
+            self.placed[c].at = (
+                round4(self.placed[c].at.0 + dx),
+                round4(self.placed[c].at.1 + dy),
+            );
+            self.placed[c].bbox = self.solid_box(c);
+        }
+    }
+
+    /// Does the sheet carry a real IC (a part with at least
+    /// `input_chain_min_pins` visible pins)? Only such sheets get their
+    /// decoupling relegated and their zones outlined — a passive-only sheet
+    /// has no functional flow to keep clean.
+    fn has_ic_major(&self) -> bool {
+        (0..self.placed.len()).any(|pi| self.is_ic_major(pi))
+    }
+
+    /// Relegate the auto-placed rail-to-rail capacitors (decoupling and bulk)
+    /// into a tidy row in the right-hand utility band, clear of the
+    /// functional flow. Each cap is stood upright (rail pin up, ground pin
+    /// down) so the router caps it with a power symbol on top and a ground
+    /// symbol below; the caps align on a shared row centered just under the
+    /// functional top and spread by a uniform pitch. Manually positioned
+    /// parts are exempt. Purely a move — the nets are untouched.
+    fn relegate_decoupling(&mut self) {
+        let cfg = self.cfg;
+        let mut targets: Vec<usize> = (0..self.placed.len())
+            .filter(|&pi| {
+                !self.placed[pi].pinned
+                    && matches!(self.placed[pi].role, Role::Decoupling | Role::Bulk)
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        targets.sort_by(|&a, &b| {
+            natord::compare(
+                &self.design.comps[self.placed[a].comp].refdes,
+                &self.design.comps[self.placed[b].comp].refdes,
+            )
+        });
+        let target_set: std::collections::BTreeSet<usize> = targets.iter().copied().collect();
+
+        // Right edge and top of everything that stays in the flow. The right
+        // edge uses the predicted routed keepouts (`solids`: power-symbol
+        // doglegs and label stubs), not just the body/text box — an IC spreads
+        // its right-edge power symbols well past its body, and the relegated
+        // band must clear that whole extent, not overlap it.
+        let mut func_right = f64::NEG_INFINITY;
+        let mut func_top = f64::INFINITY;
+        for pi in 0..self.placed.len() {
+            if target_set.contains(&pi) {
+                continue;
+            }
+            func_top = func_top.min(self.placed[pi].bbox.y1);
+            for tb in self.solids(pi) {
+                func_right = func_right.max(tb.bbox.x2);
+            }
+        }
+        if !func_right.is_finite() {
+            return; // the sheet is only caps — nothing to separate from
+        }
+
+        // Stand every cap upright (rail up, ground down) and size the row.
+        for &t in &targets {
+            self.orient_two_pin(t);
+            self.placed[t].bbox = self.solid_box(t);
+        }
+        let cell_w = targets
+            .iter()
+            .map(|&t| self.placed[t].bbox.x2 - self.placed[t].bbox.x1)
+            .fold(0.0f64, f64::max);
+        let pitch = cfg.snap_up(cell_w + cfg.grid_mm).max(cfg.utility_pitch_mm);
+        let x0 = cfg.snap(func_right + cfg.utility_gap_mm + cell_w / 2.0);
+        // The row sits just below the functional top so the upward rail
+        // symbols stay inside the sheet's vertical span.
+        let row_cy = cfg.snap(func_top + 12.7);
+        for (i, &t) in targets.iter().enumerate() {
+            let cx = round4(x0 + i as f64 * pitch);
+            let b = self.placed[t].bbox;
+            let dx = cfg.snap(cx - (b.x1 + b.x2) / 2.0);
+            let dy = cfg.snap(row_cy - (b.y1 + b.y2) / 2.0);
+            self.placed[t].at = (
+                round4(self.placed[t].at.0 + dx),
+                round4(self.placed[t].at.1 + dy),
+            );
+            self.placed[t].relegated = true;
+            self.placed[t].bbox = self.solid_box(t);
+        }
     }
 
     // --------------------------------------------------------------
@@ -609,6 +1072,23 @@ impl<'a> Engine<'a> {
             &self.nets,
             &self.pin_net,
         );
+
+        // Re-seat input filters into tidy, aligned, collision-free clusters
+        // (proximity + alignment). Runs AFTER orientation so the cluster's own
+        // orientations are final (resistors horizontal, caps upright) and
+        // nothing re-rotates or scatters it before wiring.
+        self.tidy_input_filters();
+
+        // Relegate the rail-to-rail capacitors (decoupling/bulk) into a tidy
+        // row in the right-hand utility band, out of the functional flow.
+        // Runs LAST (positions + orientations of the flow are final) and only
+        // when the sheet carries a real IC worth keeping uncluttered. The
+        // router later relegates the undriven-rail flags below this row and
+        // outlines the zones.
+        self.relegate = self.cfg.relegate_utility && self.has_ic_major();
+        if self.relegate {
+            self.relegate_decoupling();
+        }
 
         // Uniform translation into the page (margins), preserving the
         // relative geometry of pinned components.
@@ -1383,6 +1863,112 @@ pub(crate) struct TaggedBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DesignModel;
+    use crate::sheets::plan_sheets;
+
+    /// Place the root sheet of a fixture and return (model, placed sheet).
+    fn placed(sch: &pcb_sch::Schematic) -> (DesignModel, SheetModel) {
+        let cfg = SchConfig::default();
+        let design = DesignModel::build(sch, &cfg).unwrap();
+        let mut warnings = Vec::new();
+        let plan = plan_sheets(sch, &design, &cfg, "t", &mut warnings);
+        let model = place_sheet(&design, &plan, 0, &cfg, &mut warnings);
+        (design, model)
+    }
+
+    fn find(design: &DesignModel, m: &SheetModel, path_key: &str) -> usize {
+        m.placed
+            .iter()
+            .position(|p| design.comps[p.comp].path_key == path_key)
+            .unwrap_or_else(|| panic!("{path_key} not placed"))
+    }
+
+    /// Proximity: a series input resistor feeding an IC input pin is anchored
+    /// to that IC (grouped next to it), not ejected into the column flow.
+    #[test]
+    fn input_chain_resistor_anchors_to_its_ic() {
+        let sch = crate::testkit::diff_filter();
+        let (design, m) = placed(&sch);
+        let u1 = find(&design, &m, "U1");
+        for r in ["RP", "RN"] {
+            let ri = find(&design, &m, r);
+            assert_eq!(
+                m.placed[ri].group_root, u1,
+                "{r} must group with U1 (input-chain proximity)"
+            );
+        }
+    }
+
+    /// Alignment: similar input resistors share a column (common X); their
+    /// shunt capacitors share a row (common Y).
+    #[test]
+    fn input_filter_resistors_column_caps_row() {
+        let sch = crate::testkit::diff_filter();
+        let (design, m) = placed(&sch);
+        let rp = &m.placed[find(&design, &m, "RP")];
+        let rn = &m.placed[find(&design, &m, "RN")];
+        let cp = &m.placed[find(&design, &m, "CP")];
+        let cn = &m.placed[find(&design, &m, "CN")];
+        assert!(
+            (rp.at.0 - rn.at.0).abs() < 1e-6,
+            "resistors must share a column: RP.x={} RN.x={}",
+            rp.at.0,
+            rn.at.0
+        );
+        assert!(
+            (cp.at.1 - cn.at.1).abs() < 1e-6,
+            "shunt caps must share a row: CP.y={} CN.y={}",
+            cp.at.1,
+            cn.at.1
+        );
+    }
+
+    /// A plain interconnect resistor between two ICs is NOT pulled onto a
+    /// flank — the input-chain rule only fires for a terminal input branch.
+    #[test]
+    fn interconnect_resistor_stays_in_flow() {
+        use crate::testkit::{add_box, add_r, port_ref};
+        let module = pcb_sch::ModuleRef::from_path(std::path::Path::new("/test.zen"), "<root>");
+        let mut sch = pcb_sch::Schematic::new();
+        let root = pcb_sch::InstanceRef::new(module.clone(), vec![]);
+        let mut root_inst = pcb_sch::Instance::module(module.clone());
+        // Two IC boxes joined through a series resistor RS (A -> RS -> B).
+        let u1 = add_box(&mut sch, &["U1"], &[("A", "1"), ("P", "2"), ("G", "3")]);
+        let u2 = add_box(&mut sch, &["U2"], &[("B", "1"), ("P", "2"), ("G", "3")]);
+        let rs = add_r(&mut sch, &["RS"], "1k");
+        for (n, r) in [("U1", u1), ("U2", u2), ("RS", rs)] {
+            root_inst.add_child(n.to_string(), r);
+        }
+        sch.add_instance(root.clone(), root_inst);
+        sch.set_root_ref(root);
+        sch.add_net(
+            pcb_sch::Net::new("Net".to_string(), "A", 1)
+                .with_port(port_ref(&["U1"], "A"))
+                .with_port(port_ref(&["RS"], "1")),
+        );
+        sch.add_net(
+            pcb_sch::Net::new("Net".to_string(), "B", 2)
+                .with_port(port_ref(&["U2"], "B"))
+                .with_port(port_ref(&["RS"], "2")),
+        );
+        sch.add_net(
+            pcb_sch::Net::new("Power".to_string(), "P", 3)
+                .with_port(port_ref(&["U1"], "P"))
+                .with_port(port_ref(&["U2"], "P")),
+        );
+        sch.add_net(
+            pcb_sch::Net::new("Ground".to_string(), "G", 4)
+                .with_port(port_ref(&["U1"], "G"))
+                .with_port(port_ref(&["U2"], "G")),
+        );
+        sch.assign_reference_designators();
+        let (design, m) = placed(&sch);
+        let rs = find(&design, &m, "RS");
+        assert!(
+            m.placed[rs].anchor.is_none(),
+            "an IC-to-IC series resistor must stay a free major, not a flank satellite"
+        );
+    }
 
     #[test]
     fn raw_box_rotation() {

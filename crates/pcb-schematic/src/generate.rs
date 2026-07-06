@@ -223,6 +223,15 @@ fn emit_sheet(
         writer.add_no_connect(*at);
     }
 
+    // Graphic zone outlines (functional / decoupling / ERC): purely visual,
+    // no connectivity, drawn as a backdrop behind the symbols.
+    for zone in &routed.zones {
+        writer.add_zone_rect((zone.bbox.x1, zone.bbox.y1), (zone.bbox.x2, zone.bbox.y2));
+        if let Some(title) = &zone.title {
+            writer.add_zone_title(title, (zone.bbox.x1 + 0.5, zone.bbox.y1 - 0.5));
+        }
+    }
+
     // Child sheet blocks; their uuids extend the instance path.
     let own_prefix = writer.path_prefix_public();
     let mut child_prefixes = Vec::new();
@@ -254,18 +263,44 @@ fn emit_sheet(
 mod tests {
     use super::*;
     use crate::model::ATTR_SYMBOL_VALUE;
-    use crate::testkit::{analog_filter, digital_bus, divider, hierarchical_design};
+    use crate::testkit::{analog_filter, decoupled_adc, digital_bus, divider, hierarchical_design};
+
+    /// X coordinate of a placed component symbol, found by its refdes. Reads the
+    /// symbol's own `(at X Y R)` (the first `(at` after its `(lib_id`).
+    fn symbol_x(content: &str, reference: &str) -> Option<f64> {
+        let refm = format!("(property \"Reference\" \"{reference}\"");
+        for block in content.split("\t(symbol\n").skip(1) {
+            if !block.contains(&refm) {
+                continue;
+            }
+            let at = block.lines().find(|l| l.trim_start().starts_with("(at "))?;
+            return at
+                .trim()
+                .trim_start_matches("(at ")
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok());
+        }
+        None
+    }
 
     #[test]
     fn analog_net_takes_the_continuous_wiring_path() {
-        // The RC-filter node is analog: it is routed by the continuous-wire
-        // engine, which — when a clean route does not exist — reports its
-        // reluctant fallback. That log proves the ANALOG path (not the silent
-        // digital group path) handled FILT.
+        // The RC-filter node FILT is analog and routed by the continuous-wire
+        // engine. With RF grouped next to U1 by the input-chain proximity rule,
+        // the whole node now routes as one continuous wire named by a single
+        // label — proving the ANALOG path handled it, never the digital
+        // group/label path, and with no reluctant fallback.
         let out = generate_schematic(&analog_filter(), &SchOptions::new("flt")).unwrap();
+        let c = &out.files[0].content;
+        assert!(c.contains("(wire"), "FILT must be routed with real wires");
         assert!(
-            out.warnings.iter().any(|w| w.contains("analog net FILT")),
-            "FILT must be routed as analog; warnings were {:?}",
+            c.matches("(label \"FILT\"").count() <= 1,
+            "analog FILT is a continuous wire named by at most one label, not the digital label path"
+        );
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("analog net FILT")),
+            "FILT routes cleanly now; unexpected fallback in {:?}",
             out.warnings
         );
     }
@@ -312,6 +347,84 @@ mod tests {
         assert!(text.contains("\"pcb_power:GND\""));
         // Undriven rails get exactly one PWR_FLAG each.
         assert_eq!(text.matches("\"#FLG").count() / 2, 2, "one flag per rail");
+    }
+
+    #[test]
+    fn shared_power_symbol_for_same_net_pins_of_one_ic() {
+        // U1's left edge carries two VDD pins split by a signal pin: they are
+        // joined by a short bus under ONE shared VDD symbol, and its two
+        // adjacent GND pins collapse under ONE shared GND symbol. Relegation is
+        // disabled here so the count isolates the banking behaviour (a
+        // relegated sheet also emits a homonym rail symbol beside each flag).
+        let mut opts = SchOptions::new("bank");
+        opts.config.relegate_utility = false;
+        let out = generate_schematic(&crate::testkit::power_bank(), &opts).unwrap();
+        let c = &out.files[0].content;
+        assert_eq!(
+            c.matches("(lib_id \"pcb_power:VDD\")").count(),
+            1,
+            "two VDD pins of one IC must share a single symbol"
+        );
+        assert_eq!(
+            c.matches("(lib_id \"pcb_power:GND\")").count(),
+            1,
+            "two adjacent GND pins of one IC must share a single symbol"
+        );
+    }
+
+    #[test]
+    fn relegation_moves_decoupling_and_flags_out_of_the_flow() {
+        // A relegated sheet (real IC + default config) pulls its rail-to-rail
+        // decoupling cap and its undriven-rail PWR_FLAGs into the right-hand
+        // utility band and outlines the functional / decoupling / ERC zones —
+        // all without changing which power nets exist.
+        let out = generate_schematic(&decoupled_adc(), &SchOptions::new("dec")).unwrap();
+        let c = &out.files[0].content;
+        // Three graphic zone rectangles (functional / decoupling / ERC).
+        assert_eq!(
+            c.matches("(type dash)").count(),
+            3,
+            "three dashed zone outlines must be drawn"
+        );
+        // Zone titles are emitted.
+        for title in ["Functional", "Decoupling", "ERC"] {
+            assert!(
+                c.contains(&format!("(text \"{title}\"")),
+                "missing zone title {title}"
+            );
+        }
+        // The decoupling cap C1 is relegated to the right of the IC U1.
+        let cx = symbol_x(c, "C1").expect("C1 placed");
+        let ux = symbol_x(c, "U1").expect("U1 placed");
+        assert!(
+            cx > ux + 10.0,
+            "decoupling C1 (x={cx}) must sit well right of U1 (x={ux})"
+        );
+    }
+
+    #[test]
+    fn relegation_preserves_the_netlist_and_can_be_disabled() {
+        // Relegation is a pure relocation: with it on or off the same power
+        // symbols exist for the same rails (VDD driven, GND driven), so the
+        // exported connectivity is identical. Toggling the knob only moves the
+        // flag/cap glyphs.
+        let mut on = SchOptions::new("dec");
+        on.config.relegate_utility = true;
+        let mut off = SchOptions::new("dec");
+        off.config.relegate_utility = false;
+        let a = generate_schematic(&decoupled_adc(), &on).unwrap();
+        let b = generate_schematic(&decoupled_adc(), &off).unwrap();
+        // Zones appear only when relegating.
+        assert_eq!(a.files[0].content.matches("(type dash)").count(), 3);
+        assert_eq!(b.files[0].content.matches("(type dash)").count(), 0);
+        // Both keep exactly one PWR_FLAG per undriven rail (VDD + GND).
+        for out in [&a, &b] {
+            assert_eq!(
+                out.files[0].content.matches("\"#FLG").count() / 2,
+                2,
+                "one flag per undriven rail regardless of relegation"
+            );
+        }
     }
 
     #[test]

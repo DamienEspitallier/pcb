@@ -127,6 +127,33 @@ pub struct SchConfig {
     /// Role heuristics: a rail-to-rail capacitor at or above this value (in
     /// microfarads) is classified `bulk` instead of `decoupling`.
     pub bulk_capacitance_uf: f64,
+    /// Proximity grouping: a series two-pin passive on signal-only nets (an
+    /// input/output filter element) rides next to the part it feeds instead
+    /// of floating into the column flow, but only when that part carries at
+    /// least this many visible pins (a real IC, not another two-pin part).
+    /// Its input filter is then re-seated as a tidy aligned cluster (series
+    /// resistors on a shared X column, shunt caps on a shared Y row).
+    pub input_chain_min_pins: usize,
+    /// Relegation: pull auto-placed rail-to-rail capacitors (decoupling and
+    /// bulk) and the undriven-rail `PWR_FLAG`s out of the functional flow and
+    /// into a dedicated utility band on the right — decoupling aligned in a
+    /// row at the top of the band, the flags stacked below it — and outline
+    /// the functional / decoupling / ERC areas with discreet graphic
+    /// rectangles. Only sheets carrying a real IC (a part with at least
+    /// `input_chain_min_pins` pins) are relegated; a passive-only sheet keeps
+    /// its parts in place. Manually positioned (`# pcb:sch`) parts are never
+    /// relegated. Purely a placement/annotation change: the netlist is
+    /// unaffected (power symbols and flags are not netlist nodes).
+    pub relegate_utility: bool,
+    /// Horizontal clearance between the functional flow's right edge and the
+    /// relegated utility band.
+    pub utility_gap_mm: f64,
+    /// Pitch between relegated items (decoupling caps along the row, flags
+    /// down the column).
+    pub utility_pitch_mm: f64,
+    /// Padding added around a zone's contents when drawing its outline
+    /// rectangle.
+    pub zone_margin_mm: f64,
 }
 
 impl Default for SchConfig {
@@ -165,6 +192,11 @@ impl Default for SchConfig {
             inline_max_major_parts: 1,
             max_parts_per_sheet: 40,
             bulk_capacitance_uf: 10.0,
+            input_chain_min_pins: 3,
+            relegate_utility: true,
+            utility_gap_mm: 12.7,
+            utility_pitch_mm: 12.7,
+            zone_margin_mm: 3.81,
         }
     }
 }
@@ -226,6 +258,16 @@ mod tests {
         // The analog break threshold is overridable like any other field.
         let over: SchConfig = toml_str_subset("analog-break-pin-count = 16\n");
         assert_eq!(over.analog_break_pin_count, 16);
+        // New foundation knob, kebab-case, defaulted and overridable.
+        assert_eq!(cfg.input_chain_min_pins, 3);
+        let ic: SchConfig = toml_str_subset("input-chain-min-pins = 5\n");
+        assert_eq!(ic.input_chain_min_pins, 5);
+        // Relegation knobs, kebab-case, defaulted and overridable.
+        assert!(cfg.relegate_utility);
+        assert_eq!(cfg.utility_gap_mm, 12.7);
+        let rel: SchConfig = toml_str_subset("relegate-utility = false\nutility-gap-mm = 19.05\n");
+        assert!(!rel.relegate_utility);
+        assert_eq!(rel.utility_gap_mm, 19.05);
     }
 
     fn toml_str_subset(s: &str) -> SchConfig {

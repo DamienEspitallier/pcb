@@ -55,8 +55,17 @@ pub struct RoutedSheet {
     pub pwr_flags: Vec<Point>,
     pub no_connects: Vec<Point>,
     pub blocks: Vec<BlockModel>,
+    /// Graphic zone outlines (functional / decoupling / ERC), purely visual.
+    pub zones: Vec<Zone>,
     /// Content extents including routed elements (paper selection).
     pub extents: BBox,
+}
+
+/// A graphic zone outline with an optional corner title. Emitted as a thin
+/// dashed rectangle on the notes layer — no electrical meaning.
+pub struct Zone {
+    pub bbox: BBox,
+    pub title: Option<String>,
 }
 
 /// A child sheet block placed on this sheet.
@@ -267,6 +276,17 @@ pub(crate) struct Router<'a> {
     /// re-plans around the committed wire) — the uninterrupted analog wire
     /// takes precedence over the conservative keepout.
     pub(crate) analog_wiring: bool,
+    /// Bounding box of the relegated `PWR_FLAG` band (set by `relegate_flags`),
+    /// consumed by `compute_zones` to outline the ERC/utility area.
+    flag_region: Option<BBox>,
+}
+
+/// Grow an optional accumulator box by another box (union, seeding on first).
+fn union_opt(acc: &mut Option<BBox>, b: &BBox) {
+    match acc {
+        Some(c) => c.union(b),
+        None => *acc = Some(*b),
+    }
 }
 
 /// Route one placed sheet. `flag_nets` = undriven rails whose PWR_FLAG this
@@ -295,6 +315,7 @@ pub fn route_sheet(
         group_wired: BTreeMap::new(),
         collapsed: BTreeMap::new(),
         analog_wiring: false,
+        flag_region: None,
     };
     router.init_registry();
     router.route_signals();
@@ -302,6 +323,9 @@ pub fn route_sheet(
     router.mark_no_connects();
     router.place_blocks();
     router.place_port_fallbacks();
+    // Outline the functional / decoupling / ERC zones once every element
+    // (including the relegated flags placed by `route_power`) is positioned.
+    router.compute_zones();
     router.compute_extents();
     router.out
 }
@@ -933,6 +957,105 @@ impl<'a> Router<'a> {
     // Power
     // --------------------------------------------------------------
 
+    /// Serve a bank of same-net power pins on one IC side edge with a SINGLE
+    /// shared symbol. Each pin stubs out to a common bus column, a short
+    /// vertical bus joins them and one symbol caps the extreme end (top for a
+    /// rail, bottom for a ground). This is the engineer's "group the two GND
+    /// pins / VDD+REFIN+ under one symbol" rule for pins that are NOT contiguous
+    /// (a foreign pin sits between them, so `collapse_stacked_pins` cannot run a
+    /// bus along the pin column). The bus is only committed when every segment
+    /// is electrically clean (foreign contacts forbidden, frank crossings of
+    /// intervening stubs tolerated); otherwise the pins fall back to one symbol
+    /// each. Returns the endpoint indices served.
+    fn merge_power_banks(
+        &mut self,
+        name: &str,
+        eps: &[Endpoint],
+        down: bool,
+        flag_nets: &BTreeSet<String>,
+        flagged: &mut BTreeSet<String>,
+    ) -> BTreeSet<usize> {
+        let mut served: BTreeSet<usize> = BTreeSet::new();
+        // Bank = same component, same horizontal outward direction, same pin
+        // column (one IC side edge). Vertical-pin banks are left to the
+        // per-pin pass (top/bottom edges rarely stack a split rail).
+        let mut groups: BTreeMap<(usize, i64, i64), Vec<usize>> = BTreeMap::new();
+        for (i, ep) in eps.iter().enumerate() {
+            if ep.dir.0.abs() < 0.5 {
+                continue;
+            }
+            let key = (
+                ep.placed,
+                ep.dir.0.signum() as i64,
+                (ep.pos.0 * 100.0).round() as i64,
+            );
+            groups.entry(key).or_default().push(i);
+        }
+        let g = self.cfg.power_stub_mm;
+        for ((_, dirx, _), mut members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            members.sort_by(|&a, &b| {
+                eps[a]
+                    .pos
+                    .1
+                    .partial_cmp(&eps[b].pos.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let px = eps[members[0]].pos.0;
+            let ymin = eps[members[0]].pos.1;
+            let ymax = eps[*members.last().unwrap()].pos.1;
+            let placed_excl: Vec<usize> = members.iter().map(|&i| eps[i].placed).collect();
+            for k in 1..=6 {
+                let bus_x = round4(px + dirx as f64 * g * k as f64);
+                let sym_y = if down {
+                    round4(ymax + g)
+                } else {
+                    round4(ymin - g)
+                };
+                let (bus_top, bus_bot) = if down { (ymin, sym_y) } else { (sym_y, ymax) };
+                let bus = vec![(bus_x, bus_top), (bus_x, bus_bot)];
+                let mut segs: Vec<Vec<Point>> = members
+                    .iter()
+                    .map(|&i| vec![eps[i].pos, (bus_x, eps[i].pos.1)])
+                    .collect();
+                segs.push(bus.clone());
+                let gbox = power_symbol_graphic_box(name, (bus_x, sym_y), down);
+                let clean = segs.iter().all(|s| self.path_ok(s, name, &placed_excl))
+                    && self.graphic_box_clear(&gbox, name);
+                if !clean {
+                    continue;
+                }
+                for s in &segs {
+                    self.out.wires.push(s.clone());
+                    self.reg.register_path(s, name);
+                }
+                for &i in &members {
+                    let j = (bus_x, eps[i].pos.1);
+                    if self.junction_needed_at(j, name) {
+                        self.push_junction(j);
+                    }
+                }
+                self.out
+                    .power_symbols
+                    .push((name.to_string(), (bus_x, sym_y), down));
+                self.reg.power_boxes.push((gbox, name.to_string()));
+                // On a relegated sheet the flag is deferred to the utility
+                // band (`relegate_flags`); otherwise it chains here inline.
+                if flag_nets.contains(name)
+                    && flagged.insert(name.to_string())
+                    && !self.model.relegate
+                {
+                    self.attach_pwr_flag(name, (bus_x, sym_y), (dirx as f64, 0.0));
+                }
+                served.extend(members.iter().copied());
+                break;
+            }
+        }
+        served
+    }
+
     fn route_power(&mut self, flag_nets: &BTreeSet<String>) {
         let mut flagged: BTreeSet<String> = BTreeSet::new();
         for sn in 0..self.model.nets.len() {
@@ -945,8 +1068,15 @@ impl<'a> Router<'a> {
             let eps = self.net_endpoints(net);
             let eps = self.collapse_stacked_pins(eps, &name, !down);
             let aligned = self.power_align_targets(&eps, down);
+            // Group non-adjacent same-net pins of one IC edge under a single
+            // shared symbol (a short bus joins them). Pins the merge served are
+            // skipped by the per-pin pass below.
+            let served = self.merge_power_banks(&name, &eps, down, flag_nets, &mut flagged);
 
             for (index, ep) in eps.iter().enumerate() {
+                if served.contains(&index) {
+                    continue;
+                }
                 let mut att = power_attachment(self.cfg, ep.pos, ep.dir, down, 0.0, 0.0);
                 let mut found = false;
 
@@ -1060,12 +1190,18 @@ impl<'a> Router<'a> {
                     name.clone(),
                 ));
 
-                // One PWR_FLAG per undriven rail, chained next to the first
-                // power symbol of the assigned sheet.
-                if flag_nets.contains(&name) && flagged.insert(name.clone()) {
+                // One PWR_FLAG per undriven rail. On a relegated sheet it is
+                // deferred to the utility band; otherwise it chains next to
+                // the first power symbol of the assigned sheet.
+                if flag_nets.contains(&name) && flagged.insert(name.clone()) && !self.model.relegate
+                {
                     self.attach_pwr_flag(&name, att.symbol_at, ep.dir);
                 }
             }
+        }
+        // Relegated sheets: gather the deferred flags into the utility band.
+        if self.model.relegate {
+            self.relegate_flags(&flagged);
         }
     }
 
@@ -1080,7 +1216,12 @@ impl<'a> Router<'a> {
             .iter()
             .enumerate()
             .filter(|(_, ep)| {
-                ep.dir.1.abs() < 0.5 || (down && ep.dir.1 > 0.5) || (!down && ep.dir.1 < -0.5)
+                // Relegated caps sit in their own band — never share a power
+                // row with the flow (a long stretched stub would result).
+                !self.model.placed[ep.placed].relegated
+                    && (ep.dir.1.abs() < 0.5
+                        || (down && ep.dir.1 > 0.5)
+                        || (!down && ep.dir.1 < -0.5))
             })
             .map(|(index, ep)| {
                 let att = power_attachment(cfg, ep.pos, ep.dir, down, 0.0, 0.0);
@@ -1237,6 +1378,217 @@ impl<'a> Router<'a> {
         self.reg
             .power_boxes
             .push((flag_box(chosen), net.to_string()));
+    }
+
+    /// Bounding box of the relegated decoupling band: the caps' solid boxes
+    /// plus the rail/ground symbols stacked on them. `None` when nothing was
+    /// relegated on this sheet.
+    fn utility_band_box(&self) -> Option<BBox> {
+        let mut out: Option<BBox> = None;
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in &self.model.placed {
+            if !p.relegated {
+                continue;
+            }
+            lo = lo.min(p.bbox.x1);
+            hi = hi.max(p.bbox.x2);
+            union_opt(&mut out, &p.bbox);
+        }
+        let mut out = out?;
+        // The upright caps' rail/ground symbols sit on the caps' X column.
+        for (name, at, down) in &self.out.power_symbols {
+            if at.0 >= lo - EPS && at.0 <= hi + EPS {
+                out.union(&power_symbol_graphic_box(name, *at, *down));
+            }
+        }
+        Some(out)
+    }
+
+    /// Gather the deferred undriven-rail `PWR_FLAG`s into the utility band, in a
+    /// column below the relegated decoupling row. Each flag gets its own
+    /// homonym power symbol so it sits on the correct global rail through a
+    /// short local wire — no long return trace into the flow. Power symbols and
+    /// flags are not netlist nodes (the exported netlist lists only real
+    /// component pins), so this is a pure relocation: the netlist is unchanged.
+    fn relegate_flags(&mut self, flagged: &BTreeSet<String>) {
+        if flagged.is_empty() {
+            return;
+        }
+        let cfg = self.cfg;
+        // Anchor the flag column under the relegated decoupling band; fall back
+        // to the right of the functional flow when nothing was relegated there.
+        let (col_x, mut y) = match self.utility_band_box() {
+            Some(r) => (cfg.snap(r.x1), cfg.snap(r.y2 + cfg.utility_pitch_mm)),
+            None => (
+                cfg.snap(self.model.content_box.x2 + cfg.utility_gap_mm),
+                cfg.snap(self.model.content_box.y1 + 12.7),
+            ),
+        };
+        // Rails first (up glyph, texts above), grounds last (down glyph, texts
+        // below): stacked this way each row's texts point away from its
+        // neighbour instead of colliding in the gap — and it matches the
+        // engineer's VDD-over-GND utility stack.
+        let mut ordered: Vec<(&String, bool)> = flagged
+            .iter()
+            .map(|name| {
+                let down = self
+                    .model
+                    .nets
+                    .iter()
+                    .find(|n| &n.name == name)
+                    .map(|n| n.class == NetClass::Ground)
+                    .unwrap_or(false);
+                (name, down)
+            })
+            .collect();
+        ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+
+        let flag_start = self.out.pwr_flags.len();
+        let sym_start = self.out.power_symbols.len();
+        let half = |s: &str| (s.chars().count() as f64) * 0.762 + 1.27;
+        for (name, down) in ordered {
+            let sym_at = (col_x, y);
+            // A standalone power symbol (a global-rail node) with a PWR_FLAG
+            // chained beside it: the flag declares the rail driven for ERC.
+            self.out.power_symbols.push((name.clone(), sym_at, down));
+            self.reg
+                .power_boxes
+                .push((power_symbol_graphic_box(name, sym_at, down), name.clone()));
+            // Flag to the right, spaced so its wide "PWR_FLAG" value text clears
+            // the rail's own value text (both sit above their glyph).
+            let gap = cfg.snap_up(half(name) + half("PWR_FLAG") + 1.27);
+            let flag_at = (round4(col_x + gap), y);
+            self.out.wires.push(vec![sym_at, flag_at]);
+            self.reg.register_path(&[sym_at, flag_at], name);
+            self.out.pwr_flags.push(flag_at);
+            self.reg.power_boxes.push((
+                BBox {
+                    x1: flag_at.0 - 2.54,
+                    y1: flag_at.1 - 5.08,
+                    x2: flag_at.0 + 2.54,
+                    y2: flag_at.1 + 0.5,
+                },
+                name.clone(),
+            ));
+            y = cfg.snap(y + cfg.utility_pitch_mm);
+        }
+        // Record the ERC band for the zone outline.
+        let flags: Vec<Point> = self.out.pwr_flags[flag_start..].to_vec();
+        let syms: Vec<(String, Point, bool)> = self.out.power_symbols[sym_start..].to_vec();
+        let mut region: Option<BBox> = None;
+        for f in flags {
+            union_opt(
+                &mut region,
+                &BBox {
+                    x1: f.0 - 2.54,
+                    y1: f.1 - 5.08,
+                    x2: f.0 + 2.54,
+                    y2: f.1 + 0.5,
+                },
+            );
+        }
+        for (name, at, down) in syms {
+            union_opt(&mut region, &power_symbol_graphic_box(&name, at, down));
+        }
+        self.flag_region = region;
+    }
+
+    /// Outline the functional / decoupling / ERC areas with discreet graphic
+    /// rectangles. Only relegated sheets get zones (a sheet with no utility
+    /// band has nothing to separate). Purely visual — the rectangles carry no
+    /// connectivity, so neither the netlist nor ERC is affected.
+    fn compute_zones(&mut self) {
+        if !self.model.relegate {
+            return;
+        }
+        let m = self.cfg.zone_margin_mm;
+        let decoupling = self.utility_band_box();
+        let erc = self.flag_region;
+        let util_left = match (decoupling, erc) {
+            (Some(d), Some(e)) => d.x1.min(e.x1),
+            (Some(d), None) => d.x1,
+            (None, Some(e)) => e.x1,
+            (None, None) => return, // nothing relegated — no zones to separate
+        };
+        let cut = util_left - m;
+
+        // Functional zone: non-relegated solids plus the flow's routed power
+        // symbols / labels / wires that stay left of the utility band.
+        let mut func: Option<BBox> = None;
+        for p in &self.model.placed {
+            if !p.relegated {
+                union_opt(&mut func, &p.bbox);
+            }
+        }
+        for (name, at, down) in &self.out.power_symbols {
+            if at.0 < cut {
+                union_opt(&mut func, &power_symbol_graphic_box(name, *at, *down));
+            }
+        }
+        for (name, at, rot) in &self.out.net_labels {
+            if at.0 < cut {
+                union_opt(&mut func, &label_text_box(name, *at, *rot));
+            }
+        }
+        for (name, _, at, rot) in &self.out.hier_labels {
+            if at.0 < cut {
+                union_opt(&mut func, &hier_text_box(name, *at, *rot));
+            }
+        }
+        for w in &self.out.wires {
+            for pt in w {
+                if pt.0 < cut {
+                    union_opt(
+                        &mut func,
+                        &BBox {
+                            x1: pt.0,
+                            y1: pt.1,
+                            x2: pt.0,
+                            y2: pt.1,
+                        },
+                    );
+                }
+            }
+        }
+
+        let func_zone = func.map(|f| {
+            let mut f = inflate(&f, m);
+            // Keep the functional outline clear of the utility band.
+            f.x2 = f.x2.min(cut - 1.27);
+            f
+        });
+        let mut dec_zone = decoupling.map(|d| inflate(&d, m));
+        let mut erc_zone = erc.map(|e| inflate(&e, m));
+        // The ERC band sits below the decoupling band in the same column: clamp
+        // a shared border so the two outlines abut instead of overlapping.
+        if let (Some(d), Some(e)) = (dec_zone.as_mut(), erc_zone.as_mut())
+            && e.y1 < d.y2
+            && e.y1 > d.y1
+        {
+            let bound = round4((d.y2 + e.y1) / 2.0);
+            d.y2 = bound;
+            e.y1 = bound;
+        }
+        if let Some(f) = func_zone {
+            self.push_zone(f, "Functional");
+        }
+        if let Some(d) = dec_zone {
+            self.push_zone(d, "Decoupling");
+        }
+        if let Some(e) = erc_zone {
+            self.push_zone(e, "ERC");
+        }
+    }
+
+    /// Push a zone outline, skipping degenerate or non-finite boxes.
+    fn push_zone(&mut self, bbox: BBox, title: &str) {
+        if !bbox.x1.is_finite() || bbox.width() < 2.54 || bbox.height() < 2.54 {
+            return;
+        }
+        self.out.zones.push(Zone {
+            bbox,
+            title: Some(title.to_string()),
+        });
     }
 
     // --------------------------------------------------------------

@@ -156,6 +156,133 @@ pub fn divider() -> Schematic {
     sch
 }
 
+/// Differential input filter: a synthesized IC box `U1` (four pins: AINP,
+/// AINN on the left edge, VDD/GND on the right) fed through two series
+/// resistors (`RP`, `RN`) with two shunt capacitors (`CP`, `CN`) to ground.
+/// Exercises the input-chain proximity + alignment rules.
+pub fn diff_filter() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[("AINP", "1"), ("AINN", "2"), ("VDD", "3"), ("GND", "4")],
+    );
+    let rp = add_r(&mut sch, &["RP"], "6k");
+    let rn = add_r(&mut sch, &["RN"], "6k");
+    let cp = add_c(&mut sch, &["CP"], "100pF");
+    let cn = add_c(&mut sch, &["CN"], "100pF");
+    for (n, r) in [("U1", u1), ("RP", rp), ("RN", rn), ("CP", cp), ("CN", cn)] {
+        root_inst.add_child(n.to_string(), r);
+    }
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    // External differential inputs (single-endpoint terminals).
+    sch.add_net(Net::new("Net".to_string(), "AINP_EXT", 1).with_port(port_ref(&["RP"], "1")));
+    sch.add_net(Net::new("Net".to_string(), "AINN_EXT", 2).with_port(port_ref(&["RN"], "1")));
+    // Filtered nodes: series R + shunt C into the IC input pin.
+    sch.add_net(
+        Net::new("Net".to_string(), "AINP_FILT", 3)
+            .with_port(port_ref(&["RP"], "2"))
+            .with_port(port_ref(&["CP"], "1"))
+            .with_port(port_ref(&["U1"], "AINP")),
+    );
+    sch.add_net(
+        Net::new("Net".to_string(), "AINN_FILT", 4)
+            .with_port(port_ref(&["RN"], "2"))
+            .with_port(port_ref(&["CN"], "1"))
+            .with_port(port_ref(&["U1"], "AINN")),
+    );
+    sch.add_net(Net::new("Power".to_string(), "VDD", 5).with_port(port_ref(&["U1"], "VDD")));
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 6)
+            .with_port(port_ref(&["U1"], "GND"))
+            .with_port(port_ref(&["CP"], "2"))
+            .with_port(port_ref(&["CN"], "2")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
+/// Synthesized IC box `U1` whose left edge carries two VDD pins split by a
+/// signal pin (VDD, SIG, VDD) and whose right edge carries two adjacent GND
+/// pins. Exercises the shared power-symbol rule (non-adjacent bank merge +
+/// adjacent stack collapse).
+pub fn power_bank() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    // Pads 1..3 land on the left edge (VDD, SIG, VDD), 4..6 on the right
+    // (OUT, GND, GND) after the box synthesizer's split.
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[
+            ("VDDA", "1"),
+            ("SIG", "2"),
+            ("VDDB", "3"),
+            ("OUT", "4"),
+            ("GNDA", "5"),
+            ("GNDB", "6"),
+        ],
+    );
+    root_inst.add_child("U1".to_string(), u1);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(
+        Net::new("Power".to_string(), "VDD", 1)
+            .with_port(port_ref(&["U1"], "VDDA"))
+            .with_port(port_ref(&["U1"], "VDDB")),
+    );
+    sch.add_net(Net::new("Net".to_string(), "SIG", 2).with_port(port_ref(&["U1"], "SIG")));
+    sch.add_net(Net::new("Net".to_string(), "OUT", 3).with_port(port_ref(&["U1"], "OUT")));
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 4)
+            .with_port(port_ref(&["U1"], "GNDA"))
+            .with_port(port_ref(&["U1"], "GNDB")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
+/// A minimal ADC-like sheet: an IC `U1` (signal input + VDD + GND) with a
+/// rail-to-rail decoupling capacitor `C1` (VDD to GND, 100nF). VDD and GND are
+/// undriven (no `power_out` pin), so each needs a `PWR_FLAG`. Exercises utility
+/// relegation (#6 decoupling, #7 flags) and zone outlining (#8): the sheet
+/// carries a real IC, so relegation is active by default.
+pub fn decoupled_adc() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[("IN", "1"), ("VDD", "2"), ("GND", "3")],
+    );
+    let c1 = add_c(&mut sch, &["C1"], "100nF");
+    root_inst.add_child("U1".to_string(), u1);
+    root_inst.add_child("C1".to_string(), c1);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(Net::new("Net".to_string(), "IN", 1).with_port(port_ref(&["U1"], "IN")));
+    sch.add_net(
+        Net::new("Power".to_string(), "VDD", 2)
+            .with_port(port_ref(&["U1"], "VDD"))
+            .with_port(port_ref(&["C1"], "1")),
+    );
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 3)
+            .with_port(port_ref(&["U1"], "GND"))
+            .with_port(port_ref(&["C1"], "2")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
 /// Two synthesized IC boxes joined by signal net `BUS`, plus a pull-up
 /// resistor `RP` (BUS to VCC). BUS = IC-IC + one pull -> DIGITAL.
 pub fn digital_bus() -> Schematic {

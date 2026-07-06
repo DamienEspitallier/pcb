@@ -190,6 +190,7 @@ pub struct SheetWriter {
     global_labels: Vec<Sexpr>,
     hier_labels: Vec<Sexpr>,
     texts: Vec<Sexpr>,
+    graphics: Vec<Sexpr>,
     symbols: Vec<Sexpr>,
     sheets: Vec<Sexpr>,
     pwr_count: u32,
@@ -217,6 +218,7 @@ impl SheetWriter {
             global_labels: Vec::new(),
             hier_labels: Vec::new(),
             texts: Vec::new(),
+            graphics: Vec::new(),
             symbols: Vec::new(),
             sheets: Vec::new(),
             pwr_count: 0,
@@ -470,6 +472,52 @@ impl SheetWriter {
         ));
     }
 
+    /// Graphic zone outline: a thin dashed rectangle on the notes/graphic
+    /// layer grouping a functional/decoupling/ERC area. Purely visual — a
+    /// schematic graphic shape carries no connectivity, so it never affects
+    /// the netlist or ERC. Drawn discreetly (hairline, dashed, mid-gray).
+    pub fn add_zone_rect(&mut self, start: (f64, f64), end: (f64, f64)) {
+        let (x1, y1) = (round4(start.0), round4(start.1));
+        let (x2, y2) = (round4(end.0), round4(end.1));
+        let uuid = self
+            .uuids
+            .next(&["zone", &format!("{x1},{y1}"), &format!("{x2},{y2}")]);
+        self.graphics.push(node(
+            "rectangle",
+            vec![
+                node("start", vec![num(x1), num(y1)]),
+                node("end", vec![num(x2), num(y2)]),
+                node(
+                    "stroke",
+                    vec![
+                        node("width", vec![num(0.127)]),
+                        node("type", vec![sym("dash")]),
+                        node("color", vec![int(130), int(130), int(130), num(1.0)]),
+                    ],
+                ),
+                node("fill", vec![node("type", vec![sym("none")])]),
+                node("uuid", vec![sstr(&uuid)]),
+            ],
+        ));
+    }
+
+    /// Discreet title for a zone, left/bottom anchored just above its top-left
+    /// corner on the graphic layer. Purely visual — no connectivity.
+    pub fn add_zone_title(&mut self, text: &str, at: (f64, f64)) {
+        let (x, y) = (round4(at.0), round4(at.1));
+        let uuid = self.uuids.next(&["ztitle", text, &format!("{x},{y}")]);
+        self.texts.push(node(
+            "text",
+            vec![
+                sstr(text),
+                node("exclude_from_sim", vec![sym("no")]),
+                node("at", vec![num(x), num(y), int(0)]),
+                effects(&["left", "bottom"], false),
+                node("uuid", vec![sstr(&uuid)]),
+            ],
+        ));
+    }
+
     /// Power/ground symbol. The Value creates the global net — no label
     /// needed. `down` selects the ground glyph (triangle below the origin,
     /// pin pointing up into the wire); otherwise an upward VCC-style arrow.
@@ -658,6 +706,8 @@ impl SheetWriter {
         items.extend(self.global_labels.iter().cloned());
         items.extend(self.hier_labels.iter().cloned());
         items.extend(self.texts.iter().cloned());
+        // Zone outlines before symbols: they draw as a backdrop, symbols on top.
+        items.extend(self.graphics.iter().cloned());
         items.extend(self.symbols.iter().cloned());
         items.extend(self.sheets.iter().cloned());
         if self.is_root {
@@ -1092,6 +1142,23 @@ mod tests {
         // Pin instance uuids present for both pins.
         assert!(text.contains("(pin \"1\""));
         assert!(text.contains("(pin \"2\""));
+    }
+
+    #[test]
+    fn zone_rect_emits_dashed_graphic_rectangle() {
+        let mut w = writer();
+        w.add_zone_rect((170.0, 20.0), (210.0, 60.0));
+        let text = w.serialize();
+        // A graphic rectangle on the notes layer: dashed, no fill.
+        assert!(text.contains("(rectangle"));
+        assert!(text.contains("(start 170 20)"));
+        assert!(text.contains("(end 210 60)"));
+        assert!(text.contains("(type dash)"));
+        assert!(text.contains("(type none)"));
+        // Deterministic across builds.
+        let mut w2 = writer();
+        w2.add_zone_rect((170.0, 20.0), (210.0, 60.0));
+        assert_eq!(text, w2.serialize());
     }
 
     #[test]

@@ -968,9 +968,121 @@ impl<'a> Router<'a> {
         {
             rest.retain(|e| quant(e.pos) != quant(anchored.pos));
         }
+        // Rule #1: a point-to-point signal net must carry a single boundary
+        // label. When its two endpoints scattered into a pair of homonym labels
+        // (no crossing-free tree joined them), keep one label and wire the other
+        // onto it — the pull-up drops straight onto its pin across the analog
+        // inputs, exactly as the reference layout draws it — instead of
+        // duplicating the name. The scope is deliberately tight, matching the
+        // cramped-promotion rule it supersedes: only a two-endpoint net (a wider
+        // fan-out is a bus, best read as distributed labels), and never one that
+        // lands on a hub (a many-pin part fans its bus out to labels by design).
+        let two_endpoint = self.model.nets[sn].design_endpoints == 2;
+        let touches_hub = rest
+            .iter()
+            .any(|ep| is_hub_comp(self.cfg, self.design, self.model.placed[ep.placed].comp));
+        if self.cfg.dedup_signal_labels
+            && port.is_none()
+            && two_endpoint
+            && rest.len() >= 2
+            && !touches_hub
+        {
+            rest = self.dedup_signal_net(&name, rest);
+            if rest.is_empty() {
+                return;
+            }
+        }
         for ep in rest {
             self.emit_label_stub(&name, &ep, use_global);
         }
+    }
+
+    /// De-duplicate a scattered signal net onto a single label (Rule #1). Every
+    /// endpoint would otherwise carry its own homonym label; instead one
+    /// endpoint keeps the label (the module-boundary marker) and each OTHER
+    /// endpoint is wired to it as a continuous wire. Foreign frank crossings are
+    /// tolerated on those joins: they are electrically harmless and are the only
+    /// way a pull-up standing above the analog inputs can drop onto its pin
+    /// (the engineer's AD7171 R3 → DOUT/RDY across AIN+/AIN-). The wiring never
+    /// moves a netlist node, so the exported `(ref.pin)` partition is unchanged.
+    /// The surviving label is a GLOBAL port (a self-contained boundary hexagon,
+    /// the module's I/O marker) — the reference AD7171 draws SPI_MISO exactly so.
+    /// Returns the endpoints that still need their own label (empty when every
+    /// other endpoint was wired); on zero progress the attempt is rolled back
+    /// and the original `rest` is returned so per-endpoint labelling is
+    /// byte-for-byte unchanged.
+    fn dedup_signal_net(&mut self, name: &str, rest: Vec<Endpoint>) -> Vec<Endpoint> {
+        // Label carrier: the clearest port endpoint — a horizontal pin (straight
+        // stub label) on the busiest component (the IC output, not a two-pin
+        // pull), deterministic by position.
+        let rep = (0..rest.len())
+            .min_by(|&a, &b| {
+                let key = |e: &Endpoint| {
+                    let horiz = i32::from(e.dir.1.abs() >= 0.5);
+                    let pins = self.design.comps[self.model.placed[e.placed].comp].visible_pins;
+                    (
+                        horiz,
+                        -(pins as i64),
+                        (e.pos.0 * 1000.0) as i64,
+                        (e.pos.1 * 1000.0) as i64,
+                    )
+                };
+                key(&rest[a]).cmp(&key(&rest[b]))
+            })
+            .expect("rest is non-empty");
+
+        let undo = self.snapshot_wiring();
+        let start = self.reg.segs.len();
+        // The one surviving label is the module-boundary port: a global hexagon.
+        self.emit_label_stub(name, &rest[rep], true);
+
+        // Tolerate the harmless frank crossings the drops need to reach the pin.
+        let prev_analog = self.analog_wiring;
+        self.analog_wiring = true;
+        let mut wired: Vec<Endpoint> = vec![rest[rep].clone()];
+        let mut unwired: Vec<Endpoint> = Vec::new();
+        let mut joined = 0usize;
+        for (i, ep) in rest.iter().enumerate() {
+            if i == rep {
+                continue;
+            }
+            let segs: Vec<(f64, f64, f64, f64)> = self.reg.segs[start..]
+                .iter()
+                .filter(|s| s.net == name)
+                .map(|s| (s.x1, s.y1, s.x2, s.y2))
+                .collect();
+            let mut best: Option<(f64, Vec<Point>, Point)> = None;
+            for (path, join) in self.tree_join_candidates(ep, &segs, &wired) {
+                if !self.tree_candidate_feasible(&path, name) {
+                    continue;
+                }
+                let cost = self.wire_cost(&path, name);
+                if best.as_ref().is_none_or(|(bc, _, _)| cost < *bc - EPS) {
+                    best = Some((cost, path, join));
+                }
+            }
+            if let Some((_, path, join)) = best {
+                let need_junction = self.junction_needed_at(join, name);
+                self.reg.register_path(&path, name);
+                self.out.wires.push(path);
+                if need_junction {
+                    self.push_junction(join);
+                }
+                wired.push(ep.clone());
+                joined += 1;
+            } else {
+                unwired.push(ep.clone());
+            }
+        }
+        self.analog_wiring = prev_analog;
+
+        if joined == 0 {
+            // No endpoint could join the labelled stub — nothing gained. Restore
+            // the pre-dedup state so the caller labels every endpoint as before.
+            self.rollback_wiring(&undo);
+            return rest;
+        }
+        unwired
     }
 
     /// Would a LOCAL label on this endpoint be forced onto the short
@@ -1888,8 +2000,24 @@ impl<'a> Router<'a> {
             // the rail's own value text (both sit above their glyph).
             let gap = cfg.snap_up(half(name) + half("PWR_FLAG") + 1.27);
             let flag_at = (round4(col_x + gap), y);
-            self.out.wires.push(vec![sym_at, flag_at]);
-            self.reg.register_path(&[sym_at, flag_at], name);
+            // Rule #6: a power symbol / PWR_FLAG leaves along its pin axis
+            // (vertical) for at least `min_pin_exit_steps` grid steps before any
+            // bend — no wire struck at a right angle right on the glyph. Both
+            // symbols exit into their free half-plane (down for an up-pointing
+            // rail, up for a down-pointing ground) and the jog runs between the
+            // two recessed ends: sym ↓ recul → across → ↑ flag (the reference
+            // layout's ERC U-links). Purely a wire-shape change — the symbol and
+            // flag connection points are unmoved, so ERC/netlist are unaffected.
+            let recul = if down {
+                -cfg.min_pin_exit_mm()
+            } else {
+                cfg.min_pin_exit_mm()
+            };
+            let sym_knee = (sym_at.0, round4(sym_at.1 + recul));
+            let flag_knee = (flag_at.0, round4(flag_at.1 + recul));
+            let flag_link = vec![sym_at, sym_knee, flag_knee, flag_at];
+            self.reg.register_path(&flag_link, name);
+            self.out.wires.push(flag_link);
             self.out.pwr_flags.push(flag_at);
             self.reg
                 .power_boxes

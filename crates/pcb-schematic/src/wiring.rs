@@ -412,6 +412,7 @@ pub(crate) struct WiringSnapshot {
     segs: usize,
     junctions: usize,
     net_labels: usize,
+    global_labels: usize,
     hier_labels: usize,
     label_boxes: usize,
 }
@@ -423,6 +424,7 @@ impl Router<'_> {
             segs: self.reg.segs.len(),
             junctions: self.out.junctions.len(),
             net_labels: self.out.net_labels.len(),
+            global_labels: self.out.global_labels.len(),
             hier_labels: self.out.hier_labels.len(),
             label_boxes: self.reg.label_boxes.len(),
         }
@@ -433,6 +435,7 @@ impl Router<'_> {
         self.reg.segs.truncate(snap.segs);
         self.out.junctions.truncate(snap.junctions);
         self.out.net_labels.truncate(snap.net_labels);
+        self.out.global_labels.truncate(snap.global_labels);
         self.out.hier_labels.truncate(snap.hier_labels);
         self.reg.label_boxes.truncate(snap.label_boxes);
     }
@@ -590,7 +593,7 @@ impl Router<'_> {
     /// tee in the pin axis onto a perpendicular segment (real junction),
     /// two-segment L toward a segment or its end, or a pin-to-pin wire
     /// toward an already wired endpoint. Sorted shortest first.
-    fn tree_join_candidates(
+    pub(crate) fn tree_join_candidates(
         &self,
         ep: &Endpoint,
         segs: &[(f64, f64, f64, f64)],

@@ -264,8 +264,8 @@ mod tests {
     use super::*;
     use crate::model::ATTR_SYMBOL_VALUE;
     use crate::testkit::{
-        adc_dout_congested, analog_filter, decoupled_adc, diff_filter, digital_bus, divider,
-        hierarchical_design, split_rail_ic,
+        adc_dout_congested, adc_pullup_over_analog, analog_filter, decoupled_adc, diff_filter,
+        digital_bus, divider, hierarchical_design, split_rail_ic,
     };
 
     /// X coordinate of a placed component symbol, found by its refdes. Reads the
@@ -467,8 +467,14 @@ mod tests {
         // with a neighbouring net — promotes to a self-contained global label
         // for BOTH endpoints (the AD7171 SPI_MISO on DOUT/RDY, wedged between
         // AIN- and its filter column). Net names are unique, so this is a pure
-        // label-style change: the connectivity is unchanged.
-        let out = generate_schematic(&adc_dout_congested(), &SchOptions::new("dout")).unwrap();
+        // label-style change: the connectivity is unchanged. The cramp only
+        // exists when the input filter is packed tight against the IC, so the
+        // fixture is generated with a deliberately tight `input_filter_gap_mm`
+        // (the generous default spreads the filter and uncramps the pull-up —
+        // see `spread_input_filter_uncramps_the_dout_pullup`).
+        let mut opts = SchOptions::new("dout");
+        opts.config.input_filter_gap_mm = 0.0;
+        let out = generate_schematic(&adc_dout_congested(), &opts).unwrap();
         let c = &out.files[0].content;
         let globals = c.matches("(global_label \"MISO\"").count();
         let locals = c.matches("(label \"MISO\"").count(); // excludes "(global_label"
@@ -476,12 +482,76 @@ mod tests {
             locals, 0,
             "the cramped DOUT signal carries no floating local label"
         );
+        // Rule #1 (dedup) takes precedence when a continuous drop onto the pin
+        // is routable; here the pull-up is truly boxed in (a clean drop is
+        // impossible), so dedup rolls back and the mitigation of last resort —
+        // a self-contained global hexagon on each endpoint — still applies.
         assert_eq!(
             globals, 2,
             "both MISO endpoints read as global-label hexagons instead"
         );
         // Determinism guard: the promotion is stable across generations.
-        let again = generate_schematic(&adc_dout_congested(), &SchOptions::new("dout")).unwrap();
+        let again = generate_schematic(&adc_dout_congested(), &opts).unwrap();
+        assert_eq!(c, &again.files[0].content);
+    }
+
+    #[test]
+    fn spread_input_filter_uncramps_the_dout_pullup() {
+        // Mission #3. With the default (generous) input-filter spread, the ADC
+        // input filter is pushed well off the IC edge and the DOUT pull-up is
+        // re-seated over its own pin: the DOUT signal is no longer boxed in, so
+        // its local label reads cleanly and Rule #3 correctly does NOT promote
+        // it. The uncramping is the intended fix — a tight filter is what
+        // triggered the global-label mitigation in the first place.
+        let out = generate_schematic(&adc_dout_congested(), &SchOptions::new("dout")).unwrap();
+        let c = &out.files[0].content;
+        assert_eq!(
+            c.matches("(global_label \"MISO\"").count(),
+            0,
+            "the uncramped DOUT pull-up signal is not force-promoted to global"
+        );
+        // Connectivity is unchanged: the net is still named on both endpoints.
+        assert_eq!(
+            c.matches("(label \"MISO\"").count(),
+            2,
+            "both MISO endpoints still carry the (now local) net label"
+        );
+    }
+
+    #[test]
+    fn pullup_dedups_onto_one_wired_label_across_the_analog_input() {
+        // Rule #1. The DOUT pull-up sits above its pin and its continuous drop
+        // must cross the (already committed) analog-input wire to reach it, so
+        // the crossing-free digital tree cannot join the two endpoints. Label
+        // de-duplication accepts the electrically-harmless frank crossing: the
+        // net keeps a SINGLE label (the module-boundary marker) and its second
+        // endpoint is wired to it — one label + one continuous wire, exactly as
+        // the reference AD7171 draws R3 → DOUT/RDY, not a homonym label per pin.
+        // (The synthetic layout spaces the pull-up a touch further from the pin
+        // than the real part, so the drop is enabled with a wider direct-wire
+        // reach; the routing decision under test is identical.)
+        let mut opts = SchOptions::new("pu");
+        opts.config.direct_wire_max_mm = 76.2;
+        let out = generate_schematic(&adc_pullup_over_analog(), &opts).unwrap();
+        let c = &out.files[0].content;
+        let globals = c.matches("(global_label \"MISO\"").count();
+        let locals = c.matches("(label \"MISO\"").count();
+        // Exactly one label, and it is the module-boundary PORT (a global
+        // hexagon), never a homonym per endpoint.
+        assert_eq!(
+            globals, 1,
+            "the de-duplicated DOUT net keeps one global boundary port"
+        );
+        assert_eq!(locals, 0, "no floating homonym local label survives");
+        // A single surviving label implies the other endpoint was wired (a
+        // failed join rolls the whole attempt back to a label per endpoint), and
+        // the drop tees onto the stub with a real junction.
+        assert!(
+            c.contains("(junction"),
+            "the pull-up drop tees onto the DOUT stub with a junction"
+        );
+        // Determinism: the de-duplication is stable across generations.
+        let again = generate_schematic(&adc_pullup_over_analog(), &opts).unwrap();
         assert_eq!(c, &again.files[0].content);
     }
 
@@ -639,6 +709,67 @@ mod tests {
             out.push((rail.clone(), x, y, rail == "GND"));
         }
         out
+    }
+
+    /// PWR_FLAG connection points.
+    fn pwr_flags(content: &str) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        for block in content.split("\t(symbol\n").skip(1) {
+            if !block
+                .lines()
+                .any(|l| l.trim_start().starts_with("(lib_id \"pcb_power:PWR_FLAG\""))
+            {
+                continue;
+            }
+            let Some(at) = block.lines().find(|l| l.trim_start().starts_with("(at ")) else {
+                continue;
+            };
+            let mut it = at.trim().trim_start_matches("(at ").split_whitespace();
+            let x: f64 = it.next().unwrap().parse().unwrap();
+            let y: f64 = it.next().unwrap().parse().unwrap();
+            out.push((x, y));
+        }
+        out
+    }
+
+    #[test]
+    fn erc_flag_links_leave_the_symbols_vertically() {
+        // Rule #6. In the relegated ERC band a PWR_FLAG (and the rail/ground
+        // symbol beside it) must leave along its pin axis — vertically — for at
+        // least `min_pin_exit_steps` grid steps before any bend, never a wire
+        // struck at a right angle straight on the glyph. The connecting wire is a
+        // U: symbol ↕ recess → jog → ↕ into the flag.
+        let out = generate_schematic(&decoupled_adc(), &SchOptions::new("erc")).unwrap();
+        let c = &out.files[0].content;
+        let segs = wire_segments(c);
+        let flags = pwr_flags(c);
+        assert!(
+            !flags.is_empty(),
+            "the relegated sheet must carry at least one ERC flag"
+        );
+        for (fx, fy) in flags {
+            let touching: Vec<_> = segs
+                .iter()
+                .filter(|(a, b)| {
+                    (a.0 - fx).abs() < 1e-3 && (a.1 - fy).abs() < 1e-3
+                        || (b.0 - fx).abs() < 1e-3 && (b.1 - fy).abs() < 1e-3
+                })
+                .collect();
+            assert_eq!(
+                touching.len(),
+                1,
+                "exactly one wire reaches the flag at ({fx},{fy})"
+            );
+            let (a, b) = touching[0];
+            assert!(
+                (a.0 - b.0).abs() < 1e-3,
+                "the flag link leaves vertically (shared X) at ({fx},{fy})"
+            );
+            assert!(
+                (a.1 - b.1).abs() >= 2.54 - 1e-3,
+                "the flag link recesses at least two grid steps before its bend"
+            );
+        }
     }
 
     #[test]

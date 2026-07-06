@@ -745,6 +745,23 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// Sheet position and outward unit direction of the first IC pin carrying
+    /// net `sn` — the pin a satellite on that net feeds or pulls. Used to seat
+    /// a pull directly over the pin it pulls.
+    fn ic_pin_pos_dir(&self, ic: usize, sn: usize) -> Option<((f64, f64), (f64, f64))> {
+        let p = &self.placed[ic];
+        let geom = &self.design.comps[p.comp].geom;
+        for pin in geom.pins.iter().filter(|pin| !pin.hidden) {
+            if self.pin_net.get(&(ic, pin.number.clone())) != Some(&sn) {
+                continue;
+            }
+            let pos = geom.pin_position(&pin.number, p.at, p.rotation, p.mirror)?;
+            let dir = geom.pin_outward(&pin.number, p.rotation, p.mirror)?;
+            return Some((pos, dir));
+        }
+        None
+    }
+
     /// Shunt capacitors re-parented under a resistor by [`chain_shunt_caps`].
     fn shunt_caps_of(&self, r: usize) -> Vec<usize> {
         let mut caps: Vec<usize> = (0..self.placed.len())
@@ -858,13 +875,19 @@ impl<'a> Engine<'a> {
         } else {
             0.0
         };
-        // Widen the gap to the IC so the cap row spreads out under the filter
-        // zone: it gives the filtered nets room to run as continuous wires
-        // (a tight gap forces both differential legs onto cramped labels).
+        // Spread the filter off the IC edge with a generous band of air (the
+        // sheet is mostly empty): the filtered nets then run as long, but still
+        // continuous, wires and a pin-seated pull-up at the IC edge stays clear
+        // of the filter caps. The gap is at least the room the shunt-cap row
+        // needs on the node side. It stays bounded by the router's direct-wire
+        // reach: the filter→IC wire (and its jogged sibling leg) must not exceed
+        // `direct_wire_max_mm`, or the analog net would fall back to labels —
+        // spreading further than the router can wire is counter-productive.
         let gap = if caps.is_empty() {
             cfg.satellite_gap_mm
         } else {
-            cfg.snap_up(2.0 * cfg.satellite_gap_mm + cap_span)
+            let min_for_caps = cfg.snap_up(2.0 * cfg.satellite_gap_mm + cap_span);
+            cfg.snap_up(cfg.input_filter_gap_mm.max(min_for_caps))
         };
         let colx = match side {
             Side::Left => cfg.snap(ic_raw.x1 - gap - r_half),
@@ -876,15 +899,27 @@ impl<'a> Engine<'a> {
             .iter()
             .map(|&r| cfg.snap_up((self.placed[r].bbox.y2 - self.placed[r].bbox.y1) + cfg.grid_mm))
             .fold(0.0f64, f64::max);
-        let avg_pin_y = {
-            let ys: Vec<f64> = rs.iter().filter_map(|&r| self.ic_pin_y(ic, r)).collect();
-            if ys.is_empty() {
-                self.placed[ic].at.1
-            } else {
-                ys.iter().sum::<f64>() / ys.len() as f64
+        // Align the top resistor exactly on the IC pin it feeds so its leg is
+        // a straight horizontal wire into the pin (0 bends), then stack the
+        // rest of the column below at `r_pitch`. The pins of a tight
+        // differential input sit closer than one resistor cell, so only one leg
+        // can be perfectly horizontal — the engineer aligns the top one (AIN+)
+        // and lets the others jog. Falls back to centering on the average pin Y
+        // when the fed pin's ordinate is unknown.
+        let top = match self.ic_pin_y(ic, rs[0]) {
+            Some(y) => cfg.snap(y),
+            None => {
+                let avg_pin_y = {
+                    let ys: Vec<f64> = rs.iter().filter_map(|&r| self.ic_pin_y(ic, r)).collect();
+                    if ys.is_empty() {
+                        self.placed[ic].at.1
+                    } else {
+                        ys.iter().sum::<f64>() / ys.len() as f64
+                    }
+                };
+                cfg.snap(avg_pin_y - r_pitch * (rs.len() as f64 - 1.0) / 2.0)
             }
         };
-        let top = cfg.snap(avg_pin_y - r_pitch * (rs.len() as f64 - 1.0) / 2.0);
         let mut col_bottom = f64::NEG_INFINITY;
         for (i, &r) in rs.iter().enumerate() {
             let ry = round4(top + i as f64 * r_pitch);
@@ -919,6 +954,55 @@ impl<'a> Engine<'a> {
                 round4(self.placed[c].at.1 + dy),
             );
             self.placed[c].bbox = self.solid_box(c);
+        }
+    }
+
+    /// Re-seat each pull resistor directly over the IC pin it pulls so its free
+    /// leg drops straight onto that pin's exit stub as one continuous wire. The
+    /// engineer seats the DOUT pull-up just off the pin it pulls, not floating
+    /// over the IC body where the net would be forced to break into a label.
+    /// Only pulls anchored to an IC major, standing upright, whose pulled pin
+    /// exits horizontally are re-seated: the vertical drop then lands on the
+    /// pin's horizontal stub just outside the body. Purely a move along X — the
+    /// vertical position (above/below the IC) and the netlist are untouched.
+    fn reseat_pullups(&mut self) {
+        let cfg = self.cfg;
+        for pi in 0..self.placed.len() {
+            if self.placed[pi].pinned || self.placed[pi].role != Role::Pull {
+                continue;
+            }
+            // Upright two-pin part only (rail leg vertical, drop on its axis).
+            if !matches!(self.placed[pi].rotation.rem_euclid(360), 0 | 180) {
+                continue;
+            }
+            let Some(ic) = self.placed[pi].anchor else {
+                continue;
+            };
+            if !self.is_ic_major(ic) {
+                continue;
+            }
+            // The pulled signal pin on the IC (the pull's non-power net).
+            let my_nets = self.placed_net_indices(pi);
+            let Some(&sig) = my_nets
+                .iter()
+                .find(|&&sn| self.nets[sn].class == NetClass::Signal)
+            else {
+                continue;
+            };
+            let Some((pin_pos, dir)) = self.ic_pin_pos_dir(ic, sig) else {
+                continue;
+            };
+            // Only horizontal-exit pins: the upright pull's drop then lands on
+            // the pin's horizontal stub. A vertical-exit pin already faces the
+            // pull; leave it to the generic placement.
+            if dir.0.abs() < 0.5 {
+                continue;
+            }
+            // Align the pull's vertical axis (its drop) onto the pin's exit
+            // stub, `pullup_pin_gap_mm` outside the body; keep its Y.
+            let colx = cfg.snap(pin_pos.0 + dir.0 * cfg.pullup_pin_gap_mm);
+            self.placed[pi].at = (colx, self.placed[pi].at.1);
+            self.placed[pi].bbox = self.solid_box(pi);
         }
     }
 
@@ -1078,6 +1162,11 @@ impl<'a> Engine<'a> {
         // orientations are final (resistors horizontal, caps upright) and
         // nothing re-rotates or scatters it before wiring.
         self.tidy_input_filters();
+
+        // Seat each pull resistor over the pin it pulls so its leg drops onto
+        // that pin's exit stub as one continuous wire (runs after orientation
+        // so the pull is upright and the IC pins are in their final places).
+        self.reseat_pullups();
 
         // Relegate the rail-to-rail capacitors (decoupling/bulk) into a tidy
         // row in the right-hand utility band, out of the functional flow.
@@ -1967,6 +2056,64 @@ mod tests {
         assert!(
             m.placed[rs].anchor.is_none(),
             "an IC-to-IC series resistor must stay a free major, not a flank satellite"
+        );
+    }
+
+    /// Alignment (mission #5): the top input resistor of a filter is placed at
+    /// the EXACT ordinate of the IC pin it feeds, so its leg is a straight
+    /// horizontal wire into the pin (0 bends). The pins of a tight pair sit
+    /// closer than one resistor cell, so only the top leg can be perfectly
+    /// horizontal — the engineer aligns that one (AIN+).
+    #[test]
+    fn input_filter_top_resistor_aligns_to_its_ic_pin() {
+        let sch = crate::testkit::diff_filter();
+        let (design, m) = placed(&sch);
+        let u1 = find(&design, &m, "U1");
+        let rp = find(&design, &m, "RP"); // feeds AINP (pad "1"), the top pin
+        let up = &m.placed[u1];
+        let pin_y = design.comps[up.comp]
+            .geom
+            .pin_position("1", up.at, up.rotation, up.mirror)
+            .expect("AINP pin position")
+            .1;
+        assert!(
+            (m.placed[rp].at.1 - pin_y).abs() < 1e-6,
+            "top input resistor RP.y={} must equal its IC pin Y={} (straight leg)",
+            m.placed[rp].at.1,
+            pin_y
+        );
+    }
+
+    /// Placement (mission #3): a pull resistor is re-seated over the pin it
+    /// pulls, `pullup_pin_gap_mm` outside the body along the pin's exit, so its
+    /// free leg drops straight onto that pin's stub as one continuous wire
+    /// instead of floating over the IC body.
+    #[test]
+    fn pullup_reseats_over_the_pin_it_pulls() {
+        let cfg = SchConfig::default();
+        let sch = crate::testkit::adc_dout_congested();
+        let (design, m) = placed(&sch);
+        let u1 = find(&design, &m, "U1");
+        let rpu = find(&design, &m, "RPU"); // pull-up on DOUT (pad "3")
+        let up = &m.placed[u1];
+        let pin = design.comps[up.comp]
+            .geom
+            .pin_position("3", up.at, up.rotation, up.mirror)
+            .expect("DOUT position");
+        let dir = design.comps[up.comp]
+            .geom
+            .pin_outward("3", up.rotation, up.mirror)
+            .expect("DOUT direction");
+        assert!(
+            dir.0.abs() > 0.5,
+            "DOUT must exit horizontally for this test"
+        );
+        let expect_x = cfg.snap(pin.0 + dir.0 * cfg.pullup_pin_gap_mm);
+        assert!(
+            (m.placed[rpu].at.0 - expect_x).abs() < 1e-6,
+            "pull-up RPU.x={} must sit on the DOUT exit stub at x={}",
+            m.placed[rpu].at.0,
+            expect_x
         );
     }
 

@@ -56,10 +56,25 @@ pub struct SchConfig {
     pub row_gap_mm: f64,
     /// Clearance from an anchor's edge to its satellite when no offset is given.
     pub satellite_gap_mm: f64,
+    /// Horizontal air between an IC's input edge and its re-seated input-filter
+    /// resistor column, on top of the room reserved for the shunt-cap row. The
+    /// sheet is mostly empty, so the filter is spread well off the IC: the
+    /// filtered nets then run as long continuous wires across the open band and
+    /// a pin-seated pull-up at the IC edge stays clear of the filter caps. A
+    /// tight gap tasses the whole input against the IC (the reference AD7171
+    /// pushes its filter far to the left instead).
+    pub input_filter_gap_mm: f64,
     /// Horizontal pitch of satellite rows (decoupling caps, pulls, ...).
     pub satellite_pitch_mm: f64,
     /// Distance from an IC edge to its decoupling/pull row (no offset given).
     pub role_row_gap_mm: f64,
+    /// Offset, along a pulled pin's exit direction, from that IC pin to the
+    /// upright pull resistor's drop. A pull anchored to an IC is re-seated
+    /// directly over the pin it pulls so its free leg drops straight onto the
+    /// pin's exit stub as one continuous wire (instead of floating over the IC
+    /// body where the net would break into a label). Kept small so the pull
+    /// hugs the pin just outside the body — two grid steps by default.
+    pub pullup_pin_gap_mm: f64,
     /// Signal stub length (pin end to net label).
     pub stub_mm: f64,
     /// Minimum length, in grid steps, of the wire carrying a net label. The
@@ -110,6 +125,19 @@ pub struct SchConfig {
     pub crystal_gap_mm: f64,
     /// Above this distance, two aligned pins get net labels instead of wires.
     pub direct_wire_max_mm: f64,
+    /// De-duplicate the labels of a signal net onto a single boundary port.
+    /// A net must carry only ONE port/name label (the module-boundary marker):
+    /// the reader should not chase the same name across two floating labels.
+    /// When a signal net's endpoints scatter into two or more homonym labels
+    /// (its crossing-free tree could not join them), the router keeps a single
+    /// label on one endpoint and wires the OTHER endpoints to it as continuous
+    /// wires — accepting electrically-harmless frank crossings if that is the
+    /// only way to reach the label, exactly as the engineer draws a DOUT pull-up
+    /// dropping straight onto the pin across the analog input wires. The change
+    /// is purely graphical (labels and wires never move a netlist node): the
+    /// exported `(ref.pin)` net partition is unchanged. Set false to keep one
+    /// homonym label per stranded endpoint.
+    pub dedup_signal_labels: bool,
     /// Wiring cost penalty, in millimeters of equivalent path length, charged
     /// for each frank crossing of a foreign net on a candidate wire. Frank
     /// crossings are electrically harmless in KiCad (perpendicular wires that
@@ -215,8 +243,10 @@ impl Default for SchConfig {
             col_gap_mm: 19.05,
             row_gap_mm: 15.24,
             satellite_gap_mm: 7.62,
+            input_filter_gap_mm: 38.1,
             satellite_pitch_mm: 11.43,
             role_row_gap_mm: 19.05,
+            pullup_pin_gap_mm: 2.54,
             stub_mm: 5.08,
             min_pin_exit_steps: 2,
             min_net_spacing_steps: 2,
@@ -230,6 +260,7 @@ impl Default for SchConfig {
             label_elbow_mm: 2.54,
             crystal_gap_mm: 8.89,
             direct_wire_max_mm: 50.8,
+            dedup_signal_labels: true,
             crossing_penalty_mm: 20.0,
             bend_penalty_mm: 5.08,
             hub_pin_count_threshold: 10,
@@ -359,12 +390,24 @@ mod tests {
         assert_eq!(cfg.input_chain_min_pins, 3);
         let ic: SchConfig = toml_str_subset("input-chain-min-pins = 5\n");
         assert_eq!(ic.input_chain_min_pins, 5);
+        // Pull-up seating knob, kebab-case, defaulted and overridable.
+        assert_eq!(cfg.pullup_pin_gap_mm, 2.54);
+        let pu: SchConfig = toml_str_subset("pullup-pin-gap-mm = 5.08\n");
+        assert_eq!(pu.pullup_pin_gap_mm, 5.08);
+        // Input-filter spread knob, kebab-case, defaulted and overridable.
+        assert_eq!(cfg.input_filter_gap_mm, 38.1);
+        let ifg: SchConfig = toml_str_subset("input-filter-gap-mm = 25.4\n");
+        assert_eq!(ifg.input_filter_gap_mm, 25.4);
         // Relegation knobs, kebab-case, defaulted and overridable.
         assert!(cfg.relegate_utility);
         assert_eq!(cfg.utility_gap_mm, 12.7);
         let rel: SchConfig = toml_str_subset("relegate-utility = false\nutility-gap-mm = 19.05\n");
         assert!(!rel.relegate_utility);
         assert_eq!(rel.utility_gap_mm, 19.05);
+        // Label de-duplication knob, kebab-case, defaulted and overridable.
+        assert!(cfg.dedup_signal_labels);
+        let dd: SchConfig = toml_str_subset("dedup-signal-labels = false\n");
+        assert!(!dd.dedup_signal_labels);
         // Zone-grid knobs, kebab-case, defaulted and overridable.
         assert_eq!(cfg.zone_gap_mm, 0.0);
         assert_eq!(cfg.zone_snap_mm, 1.27);

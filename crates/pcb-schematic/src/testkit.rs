@@ -325,6 +325,62 @@ pub fn adc_dout_congested() -> Schematic {
     sch
 }
 
+/// A spread ADC box whose horizontal DOUT output is pulled up to VDD, with one
+/// filtered analog input entering just above DOUT. On the default (generous)
+/// grid the pull-up re-seats directly over the DOUT pin, close enough to drop a
+/// continuous wire — but that drop must cross the horizontal analog-input wire,
+/// so the crossing-free digital tree gives up. Rule #1 de-duplication then
+/// accepts the electrically-harmless frank crossing to keep DOUT on ONE wire
+/// under a single label (the reference AD7171 R3 → DOUT/RDY across AIN+/AIN-),
+/// instead of scattering a homonym label onto each endpoint.
+pub fn adc_pullup_over_analog() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    // Left edge (pads 1..2): AIN above DOUT. Right edge (pads 3..4): VDD, GND.
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[("AIN", "1"), ("DOUT", "2"), ("VDD", "3"), ("GND", "4")],
+    );
+    let rin = add_r(&mut sch, &["RIN"], "1k"); // series input resistor (analog)
+    let cin = add_c(&mut sch, &["CIN"], "100pF"); // shunt cap: makes AIN a 3-pin analog net
+    let rpu = add_r(&mut sch, &["RPU"], "10k"); // DOUT pull-up
+    for (n, r) in [("U1", u1), ("RIN", rin), ("CIN", cin), ("RPU", rpu)] {
+        root_inst.add_child(n.to_string(), r);
+    }
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(Net::new("Net".to_string(), "AIN_EXT", 1).with_port(port_ref(&["RIN"], "1")));
+    // Three endpoints (series R, shunt C, IC pin) → analog: wired as a
+    // continuous tree BEFORE the digital DOUT net, so the pull-up drop then
+    // meets a committed analog wire it must cross (as on the real AD7171).
+    sch.add_net(
+        Net::new("Net".to_string(), "AIN_FILT", 2)
+            .with_port(port_ref(&["RIN"], "2"))
+            .with_port(port_ref(&["CIN"], "1"))
+            .with_port(port_ref(&["U1"], "AIN")),
+    );
+    sch.add_net(
+        Net::new("Net".to_string(), "MISO", 3)
+            .with_port(port_ref(&["U1"], "DOUT"))
+            .with_port(port_ref(&["RPU"], "1")),
+    );
+    sch.add_net(
+        Net::new("Power".to_string(), "VDD", 4)
+            .with_port(port_ref(&["U1"], "VDD"))
+            .with_port(port_ref(&["RPU"], "2")),
+    );
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 5)
+            .with_port(port_ref(&["U1"], "GND"))
+            .with_port(port_ref(&["CIN"], "2")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
 /// An IC whose right edge carries a split VDD rail: two VDD pins (pads 5 and 8)
 /// separated by two foreign pins (a ground and a signal), the AD7171
 /// REFIN+/VDD pattern. A single rail symbol crowns both under a short offset

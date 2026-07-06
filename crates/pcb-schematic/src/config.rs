@@ -86,6 +86,22 @@ pub struct SchConfig {
     pub crystal_gap_mm: f64,
     /// Above this distance, two aligned pins get net labels instead of wires.
     pub direct_wire_max_mm: f64,
+    /// Wiring cost penalty, in millimeters of equivalent path length, charged
+    /// for each frank crossing of a foreign net on a candidate wire. Frank
+    /// crossings are electrically harmless in KiCad (perpendicular wires that
+    /// only touch at an interior point make no junction, hence no connection),
+    /// so they are allowed — but this penalty keeps the router avoiding them: a
+    /// crossing-free candidate is always preferred, and a crossing is accepted
+    /// only when it is the sole way to keep a net on one continuous wire instead
+    /// of breaking it into labels. Same-net crossings (a missing junction) stay
+    /// forbidden. Set to 0 to treat crossings as free.
+    pub crossing_penalty_mm: f64,
+    /// Wiring cost penalty, in millimeters of equivalent path length, charged
+    /// for each right-angle bend on a candidate wire. Biases the router toward
+    /// straight wires: a signal's main path runs straight into its target IC
+    /// pin and the bends are pushed onto the shunt/branch derivations (a shunt
+    /// cap tees off a straight backbone instead of sitting on its corner).
+    pub bend_penalty_mm: f64,
     /// Hub threshold: a component with more visible pins than this is a hub
     /// (MCU, big connector...); its signal nets break into net labels instead
     /// of real wires. Applied per component, not per net.
@@ -154,6 +170,18 @@ pub struct SchConfig {
     /// Padding added around a zone's contents when drawing its outline
     /// rectangle.
     pub zone_margin_mm: f64,
+    /// Gap between adjacent cells of the zone grid. Zones are laid out as a
+    /// table (functional flow on the left, the utility column split into
+    /// decoupling over ERC on the right); with a gap of 0 the neighbouring
+    /// cells share their dividing edge (the tidy look of the reference
+    /// layout), a positive value opens a channel between them. The gap never
+    /// eats into a cell's content — it is capped by the free space between the
+    /// two contents it separates.
+    pub zone_gap_mm: f64,
+    /// Zone outlines snap their outer edges outward to this grid so the cells
+    /// line up cleanly. Set to 0 to disable snapping. The inner dividers stay
+    /// centered in the free space between contents, so cells always abut.
+    pub zone_snap_mm: f64,
 }
 
 impl Default for SchConfig {
@@ -175,6 +203,8 @@ impl Default for SchConfig {
             label_elbow_mm: 2.54,
             crystal_gap_mm: 8.89,
             direct_wire_max_mm: 50.8,
+            crossing_penalty_mm: 20.0,
+            bend_penalty_mm: 5.08,
             hub_pin_count_threshold: 10,
             analog_break_pin_count: 8,
             component_pad_mm: 1.27,
@@ -197,6 +227,8 @@ impl Default for SchConfig {
             utility_gap_mm: 12.7,
             utility_pitch_mm: 12.7,
             zone_margin_mm: 3.81,
+            zone_gap_mm: 0.0,
+            zone_snap_mm: 1.27,
         }
     }
 }
@@ -258,6 +290,13 @@ mod tests {
         // The analog break threshold is overridable like any other field.
         let over: SchConfig = toml_str_subset("analog-break-pin-count = 16\n");
         assert_eq!(over.analog_break_pin_count, 16);
+        // Router cost knobs, kebab-case, defaulted and overridable.
+        assert_eq!(cfg.crossing_penalty_mm, 20.0);
+        assert_eq!(cfg.bend_penalty_mm, 5.08);
+        let pen: SchConfig =
+            toml_str_subset("crossing-penalty-mm = 30.0\nbend-penalty-mm = 2.54\n");
+        assert_eq!(pen.crossing_penalty_mm, 30.0);
+        assert_eq!(pen.bend_penalty_mm, 2.54);
         // New foundation knob, kebab-case, defaulted and overridable.
         assert_eq!(cfg.input_chain_min_pins, 3);
         let ic: SchConfig = toml_str_subset("input-chain-min-pins = 5\n");
@@ -268,6 +307,12 @@ mod tests {
         let rel: SchConfig = toml_str_subset("relegate-utility = false\nutility-gap-mm = 19.05\n");
         assert!(!rel.relegate_utility);
         assert_eq!(rel.utility_gap_mm, 19.05);
+        // Zone-grid knobs, kebab-case, defaulted and overridable.
+        assert_eq!(cfg.zone_gap_mm, 0.0);
+        assert_eq!(cfg.zone_snap_mm, 1.27);
+        let zg: SchConfig = toml_str_subset("zone-gap-mm = 2.54\nzone-snap-mm = 2.54\n");
+        assert_eq!(zg.zone_gap_mm, 2.54);
+        assert_eq!(zg.zone_snap_mm, 2.54);
     }
 
     fn toml_str_subset(s: &str) -> SchConfig {

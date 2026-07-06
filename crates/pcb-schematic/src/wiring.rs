@@ -146,6 +146,24 @@ pub(crate) fn path_length_mm(path: &[Point]) -> f64 {
         .sum()
 }
 
+/// Number of right-angle bends in an axis-aligned path: consecutive
+/// non-degenerate segments whose orientation flips (horizontal to vertical
+/// or vice versa). Collinear points and zero-length hops are not bends.
+pub(crate) fn path_bends(path: &[Point]) -> usize {
+    let mut bends = 0;
+    for w in path.windows(3) {
+        if dist(w[0], w[1]) < EPS || dist(w[1], w[2]) < EPS {
+            continue;
+        }
+        let h1 = (w[1].1 - w[0].1).abs() < EPS;
+        let h2 = (w[2].1 - w[1].1).abs() < EPS;
+        if h1 != h2 {
+            bends += 1;
+        }
+    }
+    bends
+}
+
 pub(crate) fn quant(p: Point) -> (i64, i64) {
     (
         (p.0 * 10000.0).round() as i64,
@@ -460,46 +478,71 @@ impl Router<'_> {
         false
     }
 
-    /// A real-wire tree candidate is placeable if: clean route (`path_ok`
-    /// with **no** exclusion — a wire never crosses a body, not even its
-    /// own component's), zero frank crossings ("a net that only routes by
-    /// crossing stays on labels"), length within `direct_wire_max_mm`, no
-    /// doubled wire and no traversal of a foreign predicted power corridor.
-    pub(crate) fn tree_candidate_ok(&self, path: &[Point], net: &str) -> bool {
+    /// Hard feasibility of a real-wire tree candidate, independent of foreign
+    /// crossings: clean route (`path_ok` with **no** exclusion — a wire never
+    /// crosses a body, not even its own component's), length within
+    /// `direct_wire_max_mm`, no doubled wire, no SAME-net frank crossing (that
+    /// would be a missing junction) and no traversal of a foreign predicted
+    /// power corridor. Foreign crossings are electrically harmless and are
+    /// scored separately (`wire_cost`) rather than rejected here: an analog
+    /// backbone may accept one under penalty to stay continuous instead of
+    /// breaking into labels.
+    pub(crate) fn tree_candidate_feasible(&self, path: &[Point], net: &str) -> bool {
         if path_length_mm(path) > self.cfg.direct_wire_max_mm + EPS {
             return false;
         }
         if !self.path_ok(path, net, &[]) {
             return false;
         }
-        if self.reg.count_crossings(path) != 0 {
-            return false;
-        }
         if self.overlaps_same_net(path, net) {
             return false;
         }
+        if self.reg.same_net_frank_crossing(path, net) {
+            return false;
+        }
         // A digital tree dodges the full predicted power corridor (the
-        // conservative max-stretch keepout). An analog net keeps its
-        // continuous wire and only respects the MINIMAL power footprint (the
-        // symbol graphic zone at the shortest attachment): the wire may run
-        // through the over-conservative stretch tail — the power stub, routed
-        // later, re-plans around the committed wire — but never where a power
-        // symbol will actually be drawn (that would force the stub to cross
-        // the wire).
-        let block_zone = if self.analog_wiring {
-            crate::texts::CorridorZone::Graphic
-        } else {
-            crate::texts::CorridorZone::Corridor
-        };
-        for w in path.windows(2) {
-            let seg = mk_seg(w[0], w[1], net);
-            for c in &self.corridors {
-                if c.zone == block_zone && c.net != net && seg_intersects_box(&seg, &c.bbox) {
-                    return false;
+        // conservative max-stretch keepout). An analog backbone is the
+        // engineer's top priority — a single continuous wire from the passives
+        // into the part — so it ignores the PREDICTED power keepouts entirely:
+        // power stubs are routed last and re-plan around the committed wire
+        // (min-crossing doglegs, then a visual-relaxed rescue that still
+        // forbids any real contact). The wire is only kept off genuine
+        // electrical contacts (foreign pin on the path, foreign wire touch),
+        // which `path_ok` already guarantees.
+        if !self.analog_wiring {
+            for w in path.windows(2) {
+                let seg = mk_seg(w[0], w[1], net);
+                for c in &self.corridors {
+                    if c.zone == crate::texts::CorridorZone::Corridor
+                        && c.net != net
+                        && seg_intersects_box(&seg, &c.bbox)
+                    {
+                        return false;
+                    }
                 }
             }
         }
         true
+    }
+
+    /// A real-wire tree candidate placeable with NO frank crossing at all
+    /// (`tree_candidate_feasible` plus zero crossings). Kept for the
+    /// crossing-averse passes (branch stubs): those jut into a neighbour's
+    /// band and must not also cross a foreign wire.
+    pub(crate) fn tree_candidate_ok(&self, path: &[Point], net: &str) -> bool {
+        self.tree_candidate_feasible(path, net) && self.reg.count_crossings(path) == 0
+    }
+
+    /// Cost of a candidate wire, in millimeters of equivalent length: its
+    /// Manhattan length, plus `bend_penalty_mm` per right-angle bend (straight
+    /// wires preferred, bends pushed onto branches), plus `crossing_penalty_mm`
+    /// per foreign-net frank crossing (crossings avoided but accepted when they
+    /// keep the net continuous). Same-net crossings are excluded upstream by
+    /// `tree_candidate_feasible`.
+    pub(crate) fn wire_cost(&self, path: &[Point], net: &str) -> f64 {
+        path_length_mm(path)
+            + self.cfg.bend_penalty_mm * path_bends(path) as f64
+            + self.cfg.crossing_penalty_mm * self.reg.foreign_crossings(path, net) as f64
     }
 
     /// A junction is required when a NEW wire ends at `p` (kicad-cli
@@ -690,19 +733,23 @@ impl Router<'_> {
         }
 
         // Best coverage: grow from each seed in a sandbox, keep the seed
-        // reaching the most endpoints (earliest seed breaks ties), replay it.
+        // reaching the most endpoints; among equal-coverage seeds keep the
+        // cheapest tree (fewest crossings and bends, then shortest), earliest
+        // seed breaking any remaining tie. Analog subsets are small, so trying
+        // every seed is cheap and yields the cleanest continuous wire.
         let mut best_seed: Option<(usize, usize)> = None;
         let mut best_len = 0usize;
+        let mut best_cost = f64::INFINITY;
         for &seed in &pairs {
             let undo = self.snapshot_wiring();
             let idx = self.grow_tree(net_name, &list, std::slice::from_ref(&seed));
-            if idx.len() > best_len {
-                best_len = idx.len();
-                best_seed = Some(seed);
-            }
+            let cost = self.tree_cost_since(net_name, undo.wires);
             self.rollback_wiring(&undo);
-            if best_len == list.len() {
-                break;
+            let better = idx.len() > best_len || (idx.len() == best_len && cost < best_cost - EPS);
+            if better {
+                best_len = idx.len();
+                best_cost = cost;
+                best_seed = Some(seed);
             }
         }
         let Some(seed) = best_seed else {
@@ -710,6 +757,15 @@ impl Router<'_> {
         };
         let idx = self.grow_tree(net_name, &list, std::slice::from_ref(&seed));
         idx.into_iter().map(|i| list[i].clone()).collect()
+    }
+
+    /// Total `wire_cost` of the wires appended since index `wires_start`.
+    /// Used to rank equal-coverage seed trees in `wire_group_tree`.
+    fn tree_cost_since(&self, net: &str, wires_start: usize) -> f64 {
+        self.out.wires[wires_start..]
+            .iter()
+            .map(|w| self.wire_cost(w, net))
+            .sum()
     }
 
     /// Grow one real-wire tree from the first routable pair in `seed_pairs`,
@@ -723,15 +779,35 @@ impl Router<'_> {
     ) -> Vec<usize> {
         let tree_seg_start = self.reg.segs.len();
         let mut wired_idx: Vec<usize> = Vec::new();
+        // Foreign crossings are tolerated (under `wire_cost` penalty) only when
+        // an analog backbone would otherwise break into labels; digital trees
+        // stay strictly crossing-free.
+        let allow_crossings = self.analog_wiring;
         'seed: for &(i, j) in seed_pairs {
+            // Lowest-cost seed shape for this pair: straightest, fewest bends,
+            // and crossing-free when a crossing-free shape exists.
+            let mut best: Option<(f64, Vec<Point>)> = None;
             for cand in tree_pair_candidates(
                 self.cfg,
                 (list[i].pos, list[i].dir),
                 (list[j].pos, list[j].dir),
             ) {
-                if !self.tree_candidate_ok(&cand, net_name) {
+                if !self.tree_candidate_feasible(&cand, net_name) {
                     continue;
                 }
+                if !allow_crossings && self.reg.foreign_crossings(&cand, net_name) != 0 {
+                    continue;
+                }
+                let cost = self.wire_cost(&cand, net_name);
+                let better = match &best {
+                    Some((bc, _)) => cost < *bc - EPS,
+                    None => true,
+                };
+                if better {
+                    best = Some((cost, cand));
+                }
+            }
+            if let Some((_, cand)) = best {
                 self.out.wires.push(cand.clone());
                 self.reg.register_path(&cand, net_name);
                 wired_idx.push(i);
@@ -774,20 +850,37 @@ impl Router<'_> {
                     .map(|s| (s.x1, s.y1, s.x2, s.y2))
                     .collect();
                 let wired_eps: Vec<Endpoint> = wired_idx.iter().map(|&w| list[w].clone()).collect();
-                let mut done = false;
+                // Lowest-cost join for this endpoint: a straight tee onto the
+                // backbone beats an L into a corner (bends land on the branch,
+                // not the main run), and a crossing-free join beats a crossing.
+                let mut best: Option<(f64, Vec<Point>, Point)> = None;
                 for (path, join) in self.tree_join_candidates(&list[i], &tree_segs, &wired_eps) {
-                    if !self.tree_candidate_ok(&path, net_name) {
+                    if !self.tree_candidate_feasible(&path, net_name) {
                         continue;
                     }
+                    if !allow_crossings && self.reg.foreign_crossings(&path, net_name) != 0 {
+                        continue;
+                    }
+                    let cost = self.wire_cost(&path, net_name);
+                    let better = match &best {
+                        Some((bc, _, _)) => cost < *bc - EPS,
+                        None => true,
+                    };
+                    if better {
+                        best = Some((cost, path, join));
+                    }
+                }
+                let done = if let Some((_, path, join)) = best {
                     let need_junction = self.junction_needed_at(join, net_name);
                     self.out.wires.push(path.clone());
                     self.reg.register_path(&path, net_name);
                     if need_junction {
                         self.push_junction(join);
                     }
-                    done = true;
-                    break;
-                }
+                    true
+                } else {
+                    false
+                };
                 if done {
                     wired_idx.push(i);
                     rest.remove(ri);
@@ -1152,12 +1245,16 @@ impl Router<'_> {
                     continue;
                 }
             } else if analog {
-                // Full-coverage analog net: a single annotation label names
-                // the wire, best effort — placed only when it fits on a
-                // horizontal tree segment (no jutting branch that would wall
-                // off a neighbor); otherwise the continuous wire is kept as
-                // is (the connection prevails, KiCad auto-names the net).
-                self.place_tree_net_label(&name, tree_seg_start, false);
+                // Full-coverage analog net: its single naming label is pure
+                // annotation (the wire already connects the whole net), so it
+                // is DEFERRED until every analog tree is wired. Placing it now
+                // would register a text keepout that could wall off a sibling
+                // differential leg's continuous wire (its shunt drop must be
+                // free to cross under where this label will sit); placing it
+                // last lets the crossing wires interleave first, then the label
+                // fills a remaining gap (best effort — KiCad auto-names if none).
+                self.pending_annotations
+                    .push((name.clone(), tree_seg_start));
             }
             wired_count += wired.len();
             for ep in &wired {
@@ -1511,5 +1608,25 @@ mod tests {
     #[test]
     fn path_length_is_manhattan() {
         assert!((path_length_mm(&[(0.0, 0.0), (3.0, 0.0), (3.0, 4.0)]) - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn path_bends_counts_orientation_flips() {
+        // Straight: no bend.
+        assert_eq!(path_bends(&[(0.0, 0.0), (10.0, 0.0)]), 0);
+        // Collinear split: still no bend.
+        assert_eq!(path_bends(&[(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)]), 0);
+        // L: one bend.
+        assert_eq!(path_bends(&[(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)]), 1);
+        // Z: two bends.
+        assert_eq!(
+            path_bends(&[(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (10.0, 5.0)]),
+            2
+        );
+        // A zero-length hop between two collinear runs is not a bend.
+        assert_eq!(
+            path_bends(&[(0.0, 0.0), (5.0, 0.0), (5.0, 0.0), (10.0, 0.0)]),
+            0
+        );
     }
 }

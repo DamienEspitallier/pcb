@@ -263,7 +263,9 @@ fn emit_sheet(
 mod tests {
     use super::*;
     use crate::model::ATTR_SYMBOL_VALUE;
-    use crate::testkit::{analog_filter, decoupled_adc, digital_bus, divider, hierarchical_design};
+    use crate::testkit::{
+        analog_filter, decoupled_adc, diff_filter, digital_bus, divider, hierarchical_design,
+    };
 
     /// X coordinate of a placed component symbol, found by its refdes. Reads the
     /// symbol's own `(at X Y R)` (the first `(at` after its `(lib_id`).
@@ -303,6 +305,37 @@ mod tests {
             "FILT routes cleanly now; unexpected fallback in {:?}",
             out.warnings
         );
+    }
+
+    #[test]
+    fn differential_filter_both_legs_stay_continuous_wires() {
+        // Two differential filter legs (AINP_FILT, AINN_FILT), each a series R
+        // and a shunt C into the IC. Their shunt drops interleave, so wiring one
+        // leg continuously forces the other to frank-cross it. The router now
+        // accepts that crossing (electrically harmless — no junction, no
+        // connection — merely cost-penalised) so BOTH legs stay continuous wires
+        // instead of one collapsing into labels.
+        let out = generate_schematic(&diff_filter(), &SchOptions::new("diff")).unwrap();
+        let c = &out.files[0].content;
+        for leg in ["AINP_FILT", "AINN_FILT"] {
+            assert!(
+                !out.warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("analog net {leg}"))),
+                "{leg} must stay a continuous wire (no label fallback); warnings were {:?}",
+                out.warnings
+            );
+        }
+        // Each leg is a continuous wire named by at most one annotation label,
+        // never the multi-stub label fallback a broken net produces.
+        for leg in ["AINP_FILT", "AINN_FILT"] {
+            let n = c.matches(&format!("(label \"{leg}\"")).count();
+            assert!(
+                n <= 1,
+                "{leg} must be one continuous wire (<=1 label), found {n} labels"
+            );
+        }
+        assert!(c.contains("(wire"), "the legs are routed with real wires");
     }
 
     #[test]
@@ -425,6 +458,206 @@ mod tests {
                 "one flag per undriven rail regardless of relegation"
             );
         }
+    }
+
+    /// Sheet-level dashed zone rectangles as (x1, y1, x2, y2), left to right.
+    fn zone_rects(content: &str) -> Vec<(f64, f64, f64, f64)> {
+        let lines: Vec<&str> = content.lines().collect();
+        let pt = |w: &[&str], kw: &str| -> Option<(f64, f64)> {
+            let l = w.iter().find(|l| l.trim_start().starts_with(kw))?;
+            let mut it = l
+                .trim()
+                .trim_start_matches(kw)
+                .trim_end_matches(')')
+                .split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        };
+        let mut out = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if l.trim() != "(rectangle" {
+                continue;
+            }
+            let w = &lines[i..(i + 7).min(lines.len())];
+            if !w.iter().any(|l| l.contains("(type dash)")) {
+                continue; // a symbol-body rectangle, not a zone
+            }
+            if let (Some(s), Some(e)) = (pt(w, "(start "), pt(w, "(end ")) {
+                out.push((s.0.min(e.0), s.1.min(e.1), s.0.max(e.0), s.1.max(e.1)));
+            }
+        }
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        out
+    }
+
+    /// Consecutive wire endpoints as ((x1,y1),(x2,y2)).
+    fn wire_segments(content: &str) -> Vec<((f64, f64), (f64, f64))> {
+        let mut out = Vec::new();
+        for block in content.split("\t(wire\n").skip(1) {
+            let pts: Vec<(f64, f64)> = block
+                .lines()
+                .take_while(|l| !l.contains("(stroke"))
+                .flat_map(|l| {
+                    l.match_indices("(xy ").map(move |(i, _)| {
+                        let mut it = l[i + 4..].split_whitespace();
+                        let x: f64 = it.next().unwrap().parse().unwrap();
+                        let y: f64 = it.next().unwrap().trim_end_matches(')').parse().unwrap();
+                        (x, y)
+                    })
+                })
+                .collect();
+            for w in pts.windows(2) {
+                out.push((w[0], w[1]));
+            }
+        }
+        out
+    }
+
+    /// Labels of one kind (`global_label`, `label`, ...) as (name, x, y, rot).
+    fn labels_of(content: &str, kind: &str) -> Vec<(String, f64, f64, i32)> {
+        let mut out = Vec::new();
+        for block in content.split(&format!("({kind} \"")).skip(1) {
+            let name = block.split('"').next().unwrap_or("").to_string();
+            let Some(at) = block.lines().find(|l| l.trim_start().starts_with("(at ")) else {
+                continue;
+            };
+            let mut it = at.trim().trim_start_matches("(at ").split_whitespace();
+            let x = it.next().and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+            let y = it.next().and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+            let rot = it
+                .next()
+                .and_then(|s| s.trim_end_matches(')').parse().ok())
+                .unwrap_or(0);
+            out.push((name, x, y, rot));
+        }
+        out
+    }
+
+    /// Power symbols as (rail_name, x, y, is_ground), flags excluded.
+    fn power_symbols(content: &str) -> Vec<(String, f64, f64, bool)> {
+        let mut out = Vec::new();
+        for block in content.split("\t(symbol\n").skip(1) {
+            let Some(lib) = block
+                .lines()
+                .find(|l| l.trim_start().starts_with("(lib_id \"pcb_power:"))
+            else {
+                continue;
+            };
+            let rail = lib
+                .trim()
+                .trim_start_matches("(lib_id \"pcb_power:")
+                .trim_end_matches("\")")
+                .to_string();
+            if rail == "PWR_FLAG" {
+                continue;
+            }
+            let Some(at) = block.lines().find(|l| l.trim_start().starts_with("(at ")) else {
+                continue;
+            };
+            let mut it = at.trim().trim_start_matches("(at ").split_whitespace();
+            let x: f64 = it.next().unwrap().parse().unwrap();
+            let y: f64 = it.next().unwrap().parse().unwrap();
+            out.push((rail.clone(), x, y, rail == "GND"));
+        }
+        out
+    }
+
+    #[test]
+    fn labels_read_outward_from_their_pin() {
+        // #3: a label at the end of a stub faces its pin — the connection point
+        // (and a global label's flag) toward the wire, the text reading AWAY
+        // from the pin. Regression: labels used to be flipped 180° (text over
+        // the wire, the flag pointing out of the sheet).
+        let out = generate_schematic(&decoupled_adc(), &SchOptions::new("lbl")).unwrap();
+        let c = &out.files[0].content;
+        let segs = wire_segments(c);
+        let mut checked = 0;
+        for kind in ["global_label", "label"] {
+            for (name, x, y, rot) in labels_of(c, kind) {
+                // Direction of the wire leaving the label anchor (toward the pin).
+                let Some(dir) = segs.iter().find_map(|(a, b)| {
+                    if (a.0 - x).abs() < 1e-3 && (a.1 - y).abs() < 1e-3 {
+                        Some((b.0 - a.0, b.1 - a.1))
+                    } else if (b.0 - x).abs() < 1e-3 && (b.1 - y).abs() < 1e-3 {
+                        Some((a.0 - b.0, a.1 - b.1))
+                    } else {
+                        None
+                    }
+                }) else {
+                    continue;
+                };
+                if dir.0.abs() <= dir.1.abs() {
+                    continue; // vertical stub: no horizontal reading to check
+                }
+                // Text extends +x at rot 0, -x at rot 180 — always opposite the
+                // wire, which runs toward the pin.
+                let text_dir = if rot == 0 { 1.0 } else { -1.0 };
+                assert!(
+                    text_dir * dir.0 < 0.0,
+                    "{kind} {name}: reads into its wire (rot {rot}, wire dx {})",
+                    dir.0
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected a horizontal label to check");
+    }
+
+    #[test]
+    fn zones_enclose_their_power_symbols() {
+        // #4: no drawn element pokes out of its zone. Power symbols are the
+        // classic offender — a GND once hung below the Functional rectangle.
+        let out = generate_schematic(&decoupled_adc(), &SchOptions::new("zc")).unwrap();
+        let c = &out.files[0].content;
+        let zones = zone_rects(c);
+        assert_eq!(zones.len(), 3, "functional + decoupling + erc");
+        let inside = |x1: f64, y1: f64, x2: f64, y2: f64| {
+            zones
+                .iter()
+                .any(|z| z.0 - 0.1 <= x1 && x2 <= z.2 + 0.1 && z.1 - 0.1 <= y1 && y2 <= z.3 + 0.1)
+        };
+        for (name, x, y, ground) in power_symbols(c) {
+            let ht = (name.chars().count() as f64 * 0.762 + 1.27).max(2.54);
+            let (y1, y2) = if ground { (y, y + 6.35) } else { (y - 7.62, y) };
+            assert!(
+                inside(x - ht, y1, x + ht, y2),
+                "power symbol {name} at ({x},{y}) escapes every zone"
+            );
+        }
+    }
+
+    #[test]
+    fn zones_form_a_shared_edge_grid() {
+        // #5: the three zones tile a grid — functional on the left, decoupling
+        // over erc in the right column — sharing their dividing edges.
+        let out = generate_schematic(&decoupled_adc(), &SchOptions::new("grid")).unwrap();
+        let z = zone_rects(&out.files[0].content);
+        assert_eq!(z.len(), 3);
+        let func = z[0]; // leftmost cell
+        let mut right = [z[1], z[2]];
+        right.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()); // top first
+        let (top, bot) = (right[0], right[1]); // decoupling over erc
+        let close = |a: f64, b: f64| (a - b).abs() < 0.01;
+        // The right column's two cells share their left and right edges.
+        assert!(close(top.0, bot.0), "utility cells share the left edge");
+        assert!(close(top.2, bot.2), "utility cells share the right edge");
+        // Functional spans the full height; the outer top/bottom are shared.
+        assert!(close(func.1, top.1), "functional/decoupling share the top");
+        assert!(close(func.3, bot.3), "functional/erc share the bottom");
+        // Column and row seams abut with NO gap: cells touch on a shared edge
+        // (clear channel) or overlap slightly (a stray stub reaching in), but
+        // never leave a hole between them.
+        assert!(
+            func.2 >= top.0 - 0.01,
+            "gap between functional and utility column ({} vs {})",
+            func.2,
+            top.0
+        );
+        assert!(
+            top.3 >= bot.1 - 0.01,
+            "gap between decoupling and erc ({} vs {})",
+            top.3,
+            bot.1
+        );
     }
 
     #[test]

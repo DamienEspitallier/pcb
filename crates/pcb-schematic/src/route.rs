@@ -30,7 +30,7 @@ use crate::config::SchConfig;
 use crate::geometry::BBox;
 use crate::model::{DesignModel, NetClass};
 use crate::place::{
-    SheetModel, SheetNet, inflate, label_stub_len, label_text_width, overlaps, raw_box,
+    PlacedComp, SheetModel, SheetNet, inflate, label_stub_len, label_text_width, overlaps, raw_box,
 };
 use crate::round4;
 use crate::sheets::SheetPlan;
@@ -158,6 +158,33 @@ pub(crate) fn power_symbol_graphic_box(net_name: &str, at: Point, down: bool) ->
     }
 }
 
+/// Complete drawn box of a placed component: its canonical solid box unioned
+/// with the Reference and Value texts at their FINAL placed anchors. The text
+/// pass can slide the Value to the side (past the canonical box), so a zone
+/// outline that relied on `p.bbox` alone would clip it — this box does not.
+pub(crate) fn placed_full_box(design: &DesignModel, p: &PlacedComp) -> BBox {
+    let comp = &design.comps[p.comp];
+    let mut b = p.bbox;
+    b.union(&crate::texts::ref_text_box(&comp.refdes, p.ref_at));
+    b.union(&crate::texts::value_text_box(
+        &comp.value,
+        p.value_at,
+        p.value_justify_right,
+    ));
+    b
+}
+
+/// Graphic footprint of a `PWR_FLAG` glyph anchored at its connection point
+/// (the flag and its wide value text hang above the point).
+pub(crate) fn pwr_flag_box(at: Point) -> BBox {
+    BBox {
+        x1: at.0 - 2.54,
+        y1: at.1 - 5.08,
+        x2: at.0 + 2.54,
+        y2: at.1 + 0.5,
+    }
+}
+
 impl Reg {
     fn new(label_boxes: Vec<LabelBox>) -> Reg {
         Reg {
@@ -203,6 +230,56 @@ impl Reg {
             }
         }
         n
+    }
+
+    /// Frank crossings of `points` against segments of a DIFFERENT net.
+    /// These are electrically harmless (no junction, no connection) and are
+    /// the crossings the router tolerates under a cost penalty.
+    pub(crate) fn foreign_crossings(&self, points: &[Point], net: &str) -> usize {
+        let mut n = 0;
+        for w in points.windows(2) {
+            if dist(w[0], w[1]) < EPS {
+                continue;
+            }
+            let seg = Seg {
+                x1: w[0].0,
+                y1: w[0].1,
+                x2: w[1].0,
+                y2: w[1].1,
+                net: String::new(),
+            };
+            for other in &self.segs {
+                if other.net != net && segs_cross_frank(&seg, other) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// True when `points` frank-crosses an already placed segment of the SAME
+    /// net: two wires of one net that cross without a junction read as an
+    /// accidental (and confusing) split, so this is always forbidden — even
+    /// when foreign crossings are otherwise tolerated.
+    pub(crate) fn same_net_frank_crossing(&self, points: &[Point], net: &str) -> bool {
+        for w in points.windows(2) {
+            if dist(w[0], w[1]) < EPS {
+                continue;
+            }
+            let seg = Seg {
+                x1: w[0].0,
+                y1: w[0].1,
+                x2: w[1].0,
+                y2: w[1].1,
+                net: String::new(),
+            };
+            for other in &self.segs {
+                if other.net == net && segs_cross_frank(&seg, other) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -276,6 +353,12 @@ pub(crate) struct Router<'a> {
     /// re-plans around the committed wire) — the uninterrupted analog wire
     /// takes precedence over the conservative keepout.
     pub(crate) analog_wiring: bool,
+    /// Best-effort annotation labels for full-coverage analog trees, deferred
+    /// until every analog tree is wired: `(net name, first tree segment index)`.
+    /// Placing them last keeps a net's naming label from walling off a sibling
+    /// leg's continuous wire (a differential shunt drop must be free to cross
+    /// under where the label would otherwise sit).
+    pub(crate) pending_annotations: Vec<(String, usize)>,
     /// Bounding box of the relegated `PWR_FLAG` band (set by `relegate_flags`),
     /// consumed by `compute_zones` to outline the ERC/utility area.
     flag_region: Option<BBox>,
@@ -315,6 +398,7 @@ pub fn route_sheet(
         group_wired: BTreeMap::new(),
         collapsed: BTreeMap::new(),
         analog_wiring: false,
+        pending_annotations: Vec::new(),
         flag_region: None,
     };
     router.init_registry();
@@ -595,6 +679,13 @@ impl<'a> Router<'a> {
             self.plan_and_wire_group(sn);
             label_nets.push(sn);
         }
+        // Every analog tree is now committed: place the deferred full-coverage
+        // annotation labels in the space the interleaved wires left free (a
+        // label placed earlier could have blocked a sibling leg's crossing).
+        let pending = std::mem::take(&mut self.pending_annotations);
+        for (name, tree_seg_start) in pending {
+            self.place_tree_net_label(&name, tree_seg_start, false);
+        }
         for sn in label_nets {
             self.wire_signal_net(sn);
         }
@@ -674,7 +765,10 @@ impl<'a> Router<'a> {
                     for elbow in [elbow0, elbow0 + 2.54] {
                         let knee = (ep.pos.0, round4(ep.pos.1 + ep.dir.1 * stub));
                         let end = (round4(knee.0 + side * cfg.snap_up(elbow)), knee.1);
-                        let rotation = if side > 0.0 { 180 } else { 0 };
+                        // The wire reaches the label from the knee side, so its
+                        // connection point (and the flag of a global label) must
+                        // face that way: text reads outward, away from the pin.
+                        let rotation = if side > 0.0 { 0 } else { 180 };
                         candidates.push((vec![ep.pos, knee, end], end, rotation));
                     }
                 }
@@ -715,10 +809,11 @@ impl<'a> Router<'a> {
             return;
         }
 
-        // Horizontal pin: straight stub underlining the full text, label at
-        // the distal end turned back toward the pin.
+        // Horizontal pin: straight stub from the pin end to the label. The
+        // label's connection point faces the pin (a global label's flag points
+        // back into the circuit); the text reads outward, away from the pin.
         let base = label_stub_len(cfg, name);
-        let rotation = if ep.dir.0 >= 0.0 { 180 } else { 0 };
+        let rotation = if ep.dir.0 >= 0.0 { 0 } else { 180 };
         let mut chosen: Option<(Vec<Point>, Point)> = None;
         for extra in [0.0, 2.54, 5.08, 7.62, 10.16, 12.7] {
             let end = (round4(ep.pos.0 + ep.dir.0 * (base + extra)), ep.pos.1);
@@ -1390,9 +1485,10 @@ impl<'a> Router<'a> {
             if !p.relegated {
                 continue;
             }
-            lo = lo.min(p.bbox.x1);
-            hi = hi.max(p.bbox.x2);
-            union_opt(&mut out, &p.bbox);
+            let full = placed_full_box(self.design, p);
+            lo = lo.min(full.x1);
+            hi = hi.max(full.x2);
+            union_opt(&mut out, &full);
         }
         let mut out = out?;
         // The upright caps' rail/ground symbols sit on the caps' X column.
@@ -1461,15 +1557,9 @@ impl<'a> Router<'a> {
             self.out.wires.push(vec![sym_at, flag_at]);
             self.reg.register_path(&[sym_at, flag_at], name);
             self.out.pwr_flags.push(flag_at);
-            self.reg.power_boxes.push((
-                BBox {
-                    x1: flag_at.0 - 2.54,
-                    y1: flag_at.1 - 5.08,
-                    x2: flag_at.0 + 2.54,
-                    y2: flag_at.1 + 0.5,
-                },
-                name.clone(),
-            ));
+            self.reg
+                .power_boxes
+                .push((pwr_flag_box(flag_at), name.clone()));
             y = cfg.snap(y + cfg.utility_pitch_mm);
         }
         // Record the ERC band for the zone outline.
@@ -1477,15 +1567,7 @@ impl<'a> Router<'a> {
         let syms: Vec<(String, Point, bool)> = self.out.power_symbols[sym_start..].to_vec();
         let mut region: Option<BBox> = None;
         for f in flags {
-            union_opt(
-                &mut region,
-                &BBox {
-                    x1: f.0 - 2.54,
-                    y1: f.1 - 5.08,
-                    x2: f.0 + 2.54,
-                    y2: f.1 + 0.5,
-                },
-            );
+            union_opt(&mut region, &pwr_flag_box(f));
         }
         for (name, at, down) in syms {
             union_opt(&mut region, &power_symbol_graphic_box(&name, at, down));
@@ -1502,42 +1584,58 @@ impl<'a> Router<'a> {
             return;
         }
         let m = self.cfg.zone_margin_mm;
+        // The relegated bands define the right-hand column; nothing to do when
+        // nothing was relegated.
         let decoupling = self.utility_band_box();
         let erc = self.flag_region;
-        let util_left = match (decoupling, erc) {
-            (Some(d), Some(e)) => d.x1.min(e.x1),
-            (Some(d), None) => d.x1,
-            (None, Some(e)) => e.x1,
-            (None, None) => return, // nothing relegated — no zones to separate
+        let (util_left, util_right) = match (decoupling, erc) {
+            (Some(d), Some(e)) => (d.x1.min(e.x1), d.x2.max(e.x2)),
+            (Some(d), None) => (d.x1, d.x2),
+            (None, Some(e)) => (e.x1, e.x2),
+            (None, None) => return,
         };
-        let cut = util_left - m;
 
-        // Functional zone: non-relegated solids plus the flow's routed power
-        // symbols / labels / wires that stay left of the utility band.
+        // --- Functional content: the COMPLETE extent of every non-relegated
+        // element (component solids already carry their Reference/Value text;
+        // power symbols, every label kind, flags and wires are added here). The
+        // utility seam segregates the flow from the relegated column. ---
+        let seam_raw = util_left - EPS;
         let mut func: Option<BBox> = None;
         for p in &self.model.placed {
             if !p.relegated {
-                union_opt(&mut func, &p.bbox);
+                union_opt(&mut func, &placed_full_box(self.design, p));
             }
         }
         for (name, at, down) in &self.out.power_symbols {
-            if at.0 < cut {
+            if at.0 < seam_raw {
                 union_opt(&mut func, &power_symbol_graphic_box(name, *at, *down));
             }
         }
+        for &at in &self.out.pwr_flags {
+            if at.0 < seam_raw {
+                union_opt(&mut func, &pwr_flag_box(at));
+            }
+        }
         for (name, at, rot) in &self.out.net_labels {
-            if at.0 < cut {
+            if at.0 < seam_raw {
                 union_opt(&mut func, &label_text_box(name, *at, *rot));
             }
         }
+        // A global label carries a flag glyph beyond its text on the wire side:
+        // inflate so the whole port is enclosed.
+        for (name, at, rot, _) in &self.out.global_labels {
+            if at.0 < seam_raw {
+                union_opt(&mut func, &inflate(&label_text_box(name, *at, *rot), 1.27));
+            }
+        }
         for (name, _, at, rot) in &self.out.hier_labels {
-            if at.0 < cut {
+            if at.0 < seam_raw {
                 union_opt(&mut func, &hier_text_box(name, *at, *rot));
             }
         }
         for w in &self.out.wires {
-            for pt in w {
-                if pt.0 < cut {
+            for &pt in w {
+                if pt.0 < seam_raw {
                     union_opt(
                         &mut func,
                         &BBox {
@@ -1551,32 +1649,105 @@ impl<'a> Router<'a> {
             }
         }
 
-        let func_zone = func.map(|f| {
-            let mut f = inflate(&f, m);
-            // Keep the functional outline clear of the utility band.
-            f.x2 = f.x2.min(cut - 1.27);
-            f
-        });
-        let mut dec_zone = decoupling.map(|d| inflate(&d, m));
-        let mut erc_zone = erc.map(|e| inflate(&e, m));
-        // The ERC band sits below the decoupling band in the same column: clamp
-        // a shared border so the two outlines abut instead of overlapping.
-        if let (Some(d), Some(e)) = (dec_zone.as_mut(), erc_zone.as_mut())
-            && e.y1 < d.y2
-            && e.y1 > d.y1
-        {
-            let bound = round4((d.y2 + e.y1) / 2.0);
-            d.y2 = bound;
-            e.y1 = bound;
+        // --- Grid layout: one outer rectangle divided into cells that abut on
+        // shared edges. Functional fills the left column at full height; the
+        // right column stacks Decoupling over ERC. Every cell fully encloses
+        // its content (margins added), guaranteeing nothing overflows. ---
+        let func_right = func.map(|f| f.x2).unwrap_or(util_left);
+        // Column seam centered between the two contents; each cell edge is then
+        // pulled back so it fully contains its OWN content. With a clear channel
+        // the two edges meet on a shared line (the tidy grid); when a stray
+        // functional stub reaches into the channel the cells overlap by that
+        // small amount instead of clipping it — nothing ever overflows a zone.
+        let x_seam = (func_right + util_left) / 2.0;
+        let gx = self.cfg.zone_gap_mm.min((util_left - func_right).max(0.0));
+
+        // Outer rectangle, shared by every cell; edges snapped outward.
+        let left = func.map(|f| f.x1).unwrap_or(util_left);
+        let mut top = f64::INFINITY;
+        let mut bot = f64::NEG_INFINITY;
+        for b in [func, decoupling, erc].into_iter().flatten() {
+            top = top.min(b.y1);
+            bot = bot.max(b.y2);
         }
-        if let Some(f) = func_zone {
-            self.push_zone(f, "Functional");
+        let snap = self.cfg.zone_snap_mm;
+        let out_lo = |v: f64| {
+            round4(if snap > 0.0 {
+                (v / snap).floor() * snap
+            } else {
+                v
+            })
+        };
+        let out_hi = |v: f64| {
+            round4(if snap > 0.0 {
+                (v / snap).ceil() * snap
+            } else {
+                v
+            })
+        };
+        let x_lo = out_lo(left - m);
+        let x_hi = out_hi(util_right + m);
+        let y_lo = out_lo(top - m);
+        let y_hi = out_hi(bot + m);
+        let f_x2 = round4((x_seam - gx / 2.0).max(func_right));
+        let u_x1 = round4((x_seam + gx / 2.0).min(util_left));
+
+        if func.is_some() {
+            self.push_zone(
+                BBox {
+                    x1: x_lo,
+                    y1: y_lo,
+                    x2: f_x2,
+                    y2: y_hi,
+                },
+                "Functional",
+            );
         }
-        if let Some(d) = dec_zone {
-            self.push_zone(d, "Decoupling");
-        }
-        if let Some(e) = erc_zone {
-            self.push_zone(e, "ERC");
+        match (decoupling, erc) {
+            (Some(d), Some(e)) => {
+                // Decoupling sits above ERC: split the column on a row border
+                // centered between the two bands, each edge pulled back to
+                // contain its own band (same containment rule as the column).
+                let y_seam = (d.y2 + e.y1) / 2.0;
+                let gy = self.cfg.zone_gap_mm.min((e.y1 - d.y2).max(0.0));
+                self.push_zone(
+                    BBox {
+                        x1: u_x1,
+                        y1: y_lo,
+                        x2: x_hi,
+                        y2: round4((y_seam - gy / 2.0).max(d.y2)),
+                    },
+                    "Decoupling",
+                );
+                self.push_zone(
+                    BBox {
+                        x1: u_x1,
+                        y1: round4((y_seam + gy / 2.0).min(e.y1)),
+                        x2: x_hi,
+                        y2: y_hi,
+                    },
+                    "ERC",
+                );
+            }
+            (Some(_), None) => self.push_zone(
+                BBox {
+                    x1: u_x1,
+                    y1: y_lo,
+                    x2: x_hi,
+                    y2: y_hi,
+                },
+                "Decoupling",
+            ),
+            (None, Some(_)) => self.push_zone(
+                BBox {
+                    x1: u_x1,
+                    y1: y_lo,
+                    x2: x_hi,
+                    y2: y_hi,
+                },
+                "ERC",
+            ),
+            (None, None) => {}
         }
     }
 
@@ -1696,9 +1867,11 @@ impl<'a> Router<'a> {
                         });
                         self.port_anchored.insert(name);
                     } else {
-                        self.out.net_labels.push((name.clone(), end, 0));
+                        // Label sits left of the block; the stub reaches it
+                        // from the right, so text reads outward (leftward).
+                        self.out.net_labels.push((name.clone(), end, 180));
                         self.reg.label_boxes.push(LabelBox {
-                            bbox: label_text_box(&name, end, 0),
+                            bbox: label_text_box(&name, end, 180),
                             net: name,
                             also: Vec::new(),
                         });
@@ -1720,9 +1893,11 @@ impl<'a> Router<'a> {
                         });
                         self.port_anchored.insert(name);
                     } else {
-                        self.out.net_labels.push((name.clone(), end, 180));
+                        // Label sits right of the block; the stub reaches it
+                        // from the left, so text reads outward (rightward).
+                        self.out.net_labels.push((name.clone(), end, 0));
                         self.reg.label_boxes.push(LabelBox {
-                            bbox: label_text_box(&name, end, 180),
+                            bbox: label_text_box(&name, end, 0),
                             net: name,
                             also: Vec::new(),
                         });
@@ -1780,7 +1955,9 @@ impl<'a> Router<'a> {
                     .push((name.clone(), direction, (x, y), 0));
                 self.out.wires.push(vec![(x, y), end]);
                 self.reg.register_path(&[(x, y), end], &name);
-                self.out.net_labels.push((name.clone(), end, 0));
+                // Stub reaches the homonym label from the port side (right);
+                // its text reads outward, away from the wire.
+                self.out.net_labels.push((name.clone(), end, 180));
             } else {
                 let x = cfg.snap(content.x1 - cfg.port_column_mm);
                 let y = cfg.snap(start_y + left_i as f64 * cfg.port_pitch_mm);
@@ -1791,7 +1968,9 @@ impl<'a> Router<'a> {
                     .push((name.clone(), direction, (x, y), 180));
                 self.out.wires.push(vec![(x, y), end]);
                 self.reg.register_path(&[(x, y), end], &name);
-                self.out.net_labels.push((name.clone(), end, 180));
+                // Stub reaches the homonym label from the port side (left);
+                // its text reads outward, away from the wire.
+                self.out.net_labels.push((name.clone(), end, 0));
             }
         }
     }
@@ -1907,6 +2086,25 @@ mod tests {
         let b = power_attachment(&cfg, (10.0, 10.0), (1.0, 0.0), false, 0.0, 0.0);
         assert_eq!(b.path.len(), 3);
         assert_eq!(b.symbol_at, (12.54, 7.46));
+    }
+
+    #[test]
+    fn net_aware_crossings_split_foreign_from_same_net() {
+        let mut reg = Reg::new(Vec::new());
+        reg.register_path(&[(0.0, 0.0), (10.0, 0.0)], "A"); // horizontal wire of net A
+        let vcross = [(5.0, -5.0), (5.0, 5.0)]; // vertical through the interior of A
+        // Foreign net B: a frank crossing (tolerated under penalty), not same-net.
+        assert_eq!(reg.foreign_crossings(&vcross, "B"), 1);
+        assert!(!reg.same_net_frank_crossing(&vcross, "B"));
+        // Same net A: a same-net frank crossing (a missing junction, forbidden).
+        assert_eq!(reg.foreign_crossings(&vcross, "A"), 0);
+        assert!(reg.same_net_frank_crossing(&vcross, "A"));
+        // A T-contact that only touches the wire END is not a frank crossing.
+        let vtouch = [(5.0, 0.0), (5.0, 5.0)];
+        assert_eq!(reg.foreign_crossings(&vtouch, "B"), 0);
+        assert!(!reg.same_net_frank_crossing(&vtouch, "A"));
+        // count_crossings stays net-agnostic (sums both kinds).
+        assert_eq!(reg.count_crossings(&vcross), 1);
     }
 
     #[test]

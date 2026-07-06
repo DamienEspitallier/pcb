@@ -428,7 +428,7 @@ impl SheetWriter {
                 sstr(name),
                 node("shape", vec![sym(direction.shape())]),
                 node("at", vec![num(x), num(y), int(rotation as i64)]),
-                effects(&label_justify(rotation), false),
+                effects(&flag_label_justify(rotation), false),
                 node("uuid", vec![sstr(&uuid)]),
             ],
         ));
@@ -450,7 +450,7 @@ impl SheetWriter {
                 sstr(name),
                 node("shape", vec![sym(direction.shape())]),
                 node("at", vec![num(x), num(y), int(rotation as i64)]),
-                effects(&label_justify(rotation), false),
+                effects(&flag_label_justify(rotation), false),
                 node("uuid", vec![sstr(&uuid)]),
             ],
         ));
@@ -886,13 +886,25 @@ fn render_justify(
         .collect()
 }
 
-/// Label anchoring by rotation (labels are always written so the text sits
-/// above its carrying wire).
+/// Local net-label anchoring by rotation (labels are written so the text
+/// sits above its carrying wire, hence the `bottom` component).
 fn label_justify(rotation: i32) -> Vec<&'static str> {
     if rotation.rem_euclid(360) == 180 || rotation.rem_euclid(360) == 270 {
         vec!["right", "bottom"]
     } else {
         vec!["left", "bottom"]
+    }
+}
+
+/// Flag-label anchoring by rotation, for the directional labels (global and
+/// hierarchical) whose text is centered inside a flag glyph. Only the reading
+/// side matters — no vertical component (matches KiCad's autoplaced ports):
+/// rotation 180/270 reads leftward (`right` justify), otherwise rightward.
+fn flag_label_justify(rotation: i32) -> Vec<&'static str> {
+    if rotation.rem_euclid(360) == 180 || rotation.rem_euclid(360) == 270 {
+        vec!["right"]
+    } else {
+        vec!["left"]
     }
 }
 
@@ -1203,6 +1215,21 @@ mod tests {
             render_justify(&["bottom"], 0, Some(MirrorAxis::X)),
             vec!["top"]
         );
+    }
+
+    #[test]
+    fn flag_label_justify_is_horizontal_only() {
+        // Global and hierarchical labels read outward with NO vertical
+        // component (their flag centers the text): rot 0/90 justify left,
+        // rot 180/270 justify right — never the local-label `bottom`.
+        assert_eq!(flag_label_justify(0), vec!["left"]);
+        assert_eq!(flag_label_justify(180), vec!["right"]);
+        assert_eq!(flag_label_justify(90), vec!["left"]);
+        assert_eq!(flag_label_justify(270), vec!["right"]);
+        assert!(!flag_label_justify(0).contains(&"bottom"));
+        assert!(!flag_label_justify(180).contains(&"bottom"));
+        // Local labels keep the `bottom` component (text above the wire).
+        assert!(label_justify(0).contains(&"bottom"));
     }
 
     #[test]

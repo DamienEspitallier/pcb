@@ -73,6 +73,13 @@ pub struct SchConfig {
     /// Vertical gap, in grid steps, of the Reference text above the top-left
     /// corner of the component body.
     pub ref_gap_grid_steps: u32,
+    /// Minimum straight pin exit, in grid steps. Every wire (signal stub,
+    /// power/ground dogleg, PWR_FLAG/ERC leg, stacked-pin bus tap) must leave
+    /// its component pin in a straight line, collinear with the pin, for at
+    /// least this many grid steps before its first right-angle bend. Keeps the
+    /// schematic free of right angles struck right at a pin (the engineer's
+    /// "at least two grid steps out of every pin" rule).
+    pub min_pin_exit_steps: usize,
     /// Power stub length (pin end to power symbol).
     pub power_stub_mm: f64,
     /// Power symbol row alignment: two stubs of the same net whose symbols
@@ -80,6 +87,14 @@ pub struct SchConfig {
     /// shorter stub is stretched).
     pub power_align_max_dx_mm: f64,
     pub power_align_max_dy_mm: f64,
+    /// Order the power symbols of a cluster by electrical potential on the
+    /// vertical axis and align same-potential symbols on a shared ordinate:
+    /// positive rails (VDD/VCC/+…) ride at the top, grounds (GND/VSS) at the
+    /// bottom, negative rails (VEE/-…) lower still, and every symbol of the
+    /// same potential in one alignment window shares a common Y so the sheet
+    /// reads as horizontal power bands. Purely a symbol-placement rule — the
+    /// netlist is unaffected. Set false to keep the plain same-net alignment.
+    pub align_power_by_potential: bool,
     /// Horizontal elbow used to keep net labels of vertical pins horizontal.
     pub label_elbow_mm: f64,
     /// Clearance from an MCU OSC pin to the crystal cluster axis.
@@ -194,12 +209,14 @@ impl Default for SchConfig {
             satellite_pitch_mm: 11.43,
             role_row_gap_mm: 19.05,
             stub_mm: 5.08,
+            min_pin_exit_steps: 2,
             label_stub_min_grid_steps: 4,
             value_gap_grid_steps: 1,
             ref_gap_grid_steps: 1,
             power_stub_mm: 2.54,
             power_align_max_dx_mm: 25.4,
             power_align_max_dy_mm: 7.62,
+            align_power_by_potential: true,
             label_elbow_mm: 2.54,
             crystal_gap_mm: 8.89,
             direct_wire_max_mm: 50.8,
@@ -242,6 +259,12 @@ impl SchConfig {
     /// Snap a length up to the next grid step.
     pub fn snap_up(&self, v: f64) -> f64 {
         crate::round4((v / self.grid_mm - 1e-9).ceil() * self.grid_mm)
+    }
+
+    /// Minimum straight pin-exit length in millimeters (`min_pin_exit_steps`
+    /// grid steps). A pin's first bend must sit at least this far from the pin.
+    pub fn min_pin_exit_mm(&self) -> f64 {
+        crate::round4(self.min_pin_exit_steps as f64 * self.grid_mm)
     }
 }
 
@@ -297,6 +320,16 @@ mod tests {
             toml_str_subset("crossing-penalty-mm = 30.0\nbend-penalty-mm = 2.54\n");
         assert_eq!(pen.crossing_penalty_mm, 30.0);
         assert_eq!(pen.bend_penalty_mm, 2.54);
+        // Pin-exit knob, kebab-case, defaulted and overridable.
+        assert_eq!(cfg.min_pin_exit_steps, 2);
+        assert_eq!(cfg.min_pin_exit_mm(), 2.54);
+        let pe: SchConfig = toml_str_subset("min-pin-exit-steps = 3\n");
+        assert_eq!(pe.min_pin_exit_steps, 3);
+        assert_eq!(pe.min_pin_exit_mm(), 3.81);
+        // Potential-ordering knob, kebab-case, defaulted and overridable.
+        assert!(cfg.align_power_by_potential);
+        let ap: SchConfig = toml_str_subset("align-power-by-potential = false\n");
+        assert!(!ap.align_power_by_potential);
         // New foundation knob, kebab-case, defaulted and overridable.
         assert_eq!(cfg.input_chain_min_pins, 3);
         let ic: SchConfig = toml_str_subset("input-chain-min-pins = 5\n");

@@ -36,8 +36,8 @@ use crate::round4;
 use crate::sheets::SheetPlan;
 use crate::texts::{Corridor, CorridorZone};
 use crate::wiring::{
-    EPS, Seg, dist, group_wire_subsets, is_hub_comp, is_pair_net_static, point_on_seg, quant,
-    seg_intersects_box, segs_cross_frank, segs_touch_forbidden,
+    EPS, Seg, dist, group_wire_subsets, is_hub_comp, is_pair_net_static, path_length_mm,
+    point_on_seg, quant, seg_intersects_box, segs_cross_frank, segs_touch_forbidden,
 };
 use crate::writer::PortDirection;
 
@@ -116,16 +116,20 @@ pub(crate) fn power_attachment(
     h_extra: f64,
     v_extra: f64,
 ) -> Attachment {
-    let g = cfg.power_stub_mm;
+    // The base straight leg out of a pin is never shorter than the minimum
+    // pin exit (rule #1): a right angle is only ever struck at least
+    // `min_pin_exit_steps` grid steps away from the pin.
+    let min_exit = cfg.min_pin_exit_mm();
+    let g = cfg.power_stub_mm.max(min_exit);
     if dir.0.abs() < 0.5 {
-        let end = (pin.0, round4(pin.1 + dir.1 * (g + v_extra)));
+        let end = (pin.0, round4(pin.1 + dir.1 * (g + v_extra).max(min_exit)));
         return Attachment {
             path: vec![pin, end],
             symbol_at: end,
             down,
         };
     }
-    let elbow = (round4(pin.0 + dir.0 * (g + h_extra)), pin.1);
+    let elbow = (round4(pin.0 + dir.0 * (g + h_extra).max(min_exit)), pin.1);
     let end = (
         elbow.0,
         round4(elbow.1 + if down { g + v_extra } else { -(g + v_extra) }),
@@ -172,6 +176,37 @@ pub(crate) fn placed_full_box(design: &DesignModel, p: &PlacedComp) -> BBox {
         p.value_justify_right,
     ));
     b
+}
+
+/// Does a power net name read as a negative rail (VEE, V-, -12V, ...)? Used to
+/// order power symbols by potential: a negative rail rides below ground.
+pub(crate) fn is_negative_rail_name(name: &str) -> bool {
+    let u = name.trim().to_ascii_uppercase();
+    u.starts_with('-') || u.starts_with("V-") || u.contains("VEE") || u.contains("VNEG")
+}
+
+/// Vertical potential rank of a power net: the higher the rank the higher the
+/// symbol rides on the sheet. Positive rails (VDD/VCC/+…) outrank ground,
+/// ground outranks negative rails (VEE/-…). Drives the by-potential ordering
+/// and alignment of a cluster's power symbols (rule #3).
+pub(crate) fn power_potential_rank(name: &str, class: NetClass) -> i32 {
+    match class {
+        NetClass::Power => {
+            if is_negative_rail_name(name) {
+                -1
+            } else {
+                1
+            }
+        }
+        NetClass::Ground => 0,
+        NetClass::Signal => 0,
+    }
+}
+
+/// A power symbol hangs its leg DOWNWARD (ground-style) at or below ground
+/// potential — grounds and negative rails — and points up for positive rails.
+pub(crate) fn power_points_down(name: &str, class: NetClass) -> bool {
+    power_potential_rank(name, class) <= 0
 }
 
 /// Graphic footprint of a `PWR_FLAG` glyph anchored at its connection point
@@ -280,6 +315,22 @@ impl Reg {
             }
         }
         false
+    }
+}
+
+/// Orientation of a net label relative to the outward (port) reading of its
+/// stub. A **global/hierarchical** label is a directional port: its text reads
+/// outward, away from the circuit, off the wire's terminal end (`outward`
+/// kept as is). A **local** net label instead names the conductor it sits on:
+/// its text must overhang the wire (the wire runs under the text and continues
+/// past it) rather than hang off the end, so it reads *back over* the wire —
+/// the outward rotation flipped by 180°. Only the text orientation changes; the
+/// connection point is untouched, so connectivity/netlist/ERC are unaffected.
+pub(crate) fn net_label_rotation(global: bool, outward: i32) -> i32 {
+    if global {
+        outward
+    } else {
+        (outward + 180).rem_euclid(360)
     }
 }
 
@@ -476,7 +527,7 @@ impl<'a> Router<'a> {
         let net = &self.model.nets[sn];
         let name = net.name.clone();
         let eps = self.net_endpoints(net);
-        let eps = self.collapse_stacked_pins(eps, &name, true);
+        let eps = self.collapse_stacked_pins(eps, &name, true, false);
         self.collapsed.insert(sn, eps.clone());
         eps
     }
@@ -487,11 +538,19 @@ impl<'a> Router<'a> {
     /// connects in KiCad without junctions) and only the extreme pin keeps
     /// a label/power attachment. `extreme_up` picks the top/left pin of the
     /// stack (power rails), otherwise the bottom/right one (grounds).
+    ///
+    /// For `power` nets a horizontal stack prefers an *offset* bus — every pin
+    /// taps out straight for at least `min_pin_exit_steps` grid steps before
+    /// meeting the shared bus column (rule #1), and the returned representative
+    /// caps that column with its power symbol — whenever the component edge is
+    /// clear enough for it; otherwise it falls back to the through-tip bus (an
+    /// edge that interleaves a foreign rail keeps the tight in-column bus).
     fn collapse_stacked_pins(
         &mut self,
         eps: Vec<Endpoint>,
         net: &str,
         extreme_up: bool,
+        power: bool,
     ) -> Vec<Endpoint> {
         // Group by (component, outward direction, aligned coordinate).
         let mut groups: BTreeMap<(usize, i8, i8, i64), Vec<Endpoint>> = BTreeMap::new();
@@ -532,6 +591,15 @@ impl<'a> Router<'a> {
                     out.extend(run);
                     continue;
                 }
+                // Power/ground stack on a side edge: try the offset bus first so
+                // every pin leaves straight for >= min_pin_exit steps (rule #1).
+                if power
+                    && horiz
+                    && let Some(rep) = self.try_offset_power_stack(&run, net, dx, extreme_up)
+                {
+                    out.push(rep);
+                    continue;
+                }
                 // One segment per pin pair: a KiCad pin only connects to a
                 // wire END, never to a wire interior.
                 let points: Vec<Point> = run.iter().map(|e| e.pos).collect();
@@ -546,6 +614,86 @@ impl<'a> Router<'a> {
             }
         }
         out
+    }
+
+    /// Route a horizontal power/ground stack onto an offset bus: every pin taps
+    /// straight out for at least `min_pin_exit_steps` grid steps to a shared
+    /// column, and the returned representative caps that column with a vertical
+    /// power-symbol leg. Returns `None` (the caller keeps the through-tip bus)
+    /// when a foreign rail is interleaved on the same edge inside the band the
+    /// bus and symbol grow into — that later rail could only clear the offset
+    /// bus by shorting onto it — or when no clean offset column exists. On
+    /// success the tap + bus wires and their junctions are committed. `run` is
+    /// sorted by ascending pin ordinate; `dx` is the pins' outward sign.
+    fn try_offset_power_stack(
+        &mut self,
+        run: &[Endpoint],
+        net: &str,
+        dx: i8,
+        extreme_up: bool,
+    ) -> Option<Endpoint> {
+        let down = !extreme_up;
+        let g = self.cfg.grid_mm;
+        let stub = self.cfg.power_stub_mm;
+        let min_exit = self.cfg.min_pin_exit_mm();
+        let px = run[0].pos.0;
+        let ymin = run[0].pos.1;
+        let ymax = run[run.len() - 1].pos.1;
+        // A foreign pin on this same edge column, inside the band the bus and
+        // its symbol grow into, forbids the offset (it would be walled off).
+        let (band_lo, band_hi) = if down {
+            (ymin - EPS, ymax + stub + EPS)
+        } else {
+            (ymin - stub - EPS, ymax + EPS)
+        };
+        for (pxx, pyy, pnet) in &self.reg.pins {
+            if pnet != net && (pxx - px).abs() < EPS && *pyy > band_lo && *pyy < band_hi {
+                return None;
+            }
+        }
+        let placed_excl: Vec<usize> = run.iter().map(|e| e.placed).collect();
+        let extreme_y = if down { ymax } else { ymin };
+        for step in 0..=8 {
+            let bus_x = round4(px + dx as f64 * (min_exit + step as f64 * g));
+            let taps: Vec<Vec<Point>> = run.iter().map(|e| vec![e.pos, (bus_x, e.pos.1)]).collect();
+            let bus = vec![(bus_x, ymin), (bus_x, ymax)];
+            let sym_y = if down {
+                round4(ymax + stub)
+            } else {
+                round4(ymin - stub)
+            };
+            let gbox = power_symbol_graphic_box(net, (bus_x, sym_y), down);
+            let clean = taps.iter().all(|t| self.path_ok(t, net, &placed_excl))
+                && self.path_ok(&bus, net, &placed_excl)
+                && self.graphic_box_clear(&gbox, net);
+            if !clean {
+                continue;
+            }
+            for t in &taps {
+                self.out.wires.push(t.clone());
+                self.reg.register_path(t, net);
+            }
+            self.out.wires.push(bus.clone());
+            self.reg.register_path(&bus, net);
+            for e in run {
+                let j = (bus_x, e.pos.1);
+                if self.junction_needed_at(j, net) {
+                    self.push_junction(j);
+                }
+            }
+            let rep0 = if extreme_up {
+                &run[0]
+            } else {
+                &run[run.len() - 1]
+            };
+            return Some(Endpoint {
+                placed: rep0.placed,
+                pad: rep0.pad.clone(),
+                pos: (bus_x, extreme_y),
+                dir: (0.0, if down { 1.0 } else { -1.0 }),
+            });
+        }
+        None
     }
 
     pub(crate) fn path_ok(&self, points: &[Point], net: &str, exclude: &[usize]) -> bool {
@@ -765,10 +913,12 @@ impl<'a> Router<'a> {
                     for elbow in [elbow0, elbow0 + 2.54] {
                         let knee = (ep.pos.0, round4(ep.pos.1 + ep.dir.1 * stub));
                         let end = (round4(knee.0 + side * cfg.snap_up(elbow)), knee.1);
-                        // The wire reaches the label from the knee side, so its
-                        // connection point (and the flag of a global label) must
-                        // face that way: text reads outward, away from the pin.
-                        let rotation = if side > 0.0 { 0 } else { 180 };
+                        // The wire reaches the label from the knee side. A
+                        // global label's flag faces that way (text reads outward,
+                        // away from the pin); a local net label instead reads
+                        // back over its elbow wire (`net_label_rotation`).
+                        let outward = if side > 0.0 { 0 } else { 180 };
+                        let rotation = net_label_rotation(global, outward);
                         candidates.push((vec![ep.pos, knee, end], end, rotation));
                     }
                 }
@@ -810,10 +960,13 @@ impl<'a> Router<'a> {
         }
 
         // Horizontal pin: straight stub from the pin end to the label. The
-        // label's connection point faces the pin (a global label's flag points
-        // back into the circuit); the text reads outward, away from the pin.
+        // label's connection point faces the pin. A global label's flag reads
+        // outward off the far end; a local net label reads back over the stub
+        // (the wire underlines the full text — `label_stub_len` guarantees the
+        // stub is at least as long as the text — and runs on to the pin).
         let base = label_stub_len(cfg, name);
-        let rotation = if ep.dir.0 >= 0.0 { 0 } else { 180 };
+        let outward = if ep.dir.0 >= 0.0 { 0 } else { 180 };
+        let rotation = net_label_rotation(global, outward);
         let mut chosen: Option<(Vec<Point>, Point)> = None;
         for extra in [0.0, 2.54, 5.08, 7.62, 10.16, 12.7] {
             let end = (round4(ep.pos.0 + ep.dir.0 * (base + extra)), ep.pos.1);
@@ -835,7 +988,9 @@ impl<'a> Router<'a> {
         match chosen {
             Some((path, end)) => self.commit_label(name, path, end, rotation, global),
             None => {
-                // Cramped fallback: short stub, text pointing outward.
+                // Cramped fallback: the stub is too short to underline the
+                // text, so the label keeps its outward (off-the-end) reading —
+                // a local net label cannot overhang a wire that short.
                 let end = (round4(ep.pos.0 + ep.dir.0 * 2.54), ep.pos.1);
                 let rot = if ep.dir.0 >= 0.0 { 0 } else { 180 };
                 self.commit_label(name, vec![ep.pos, end], end, rot, global);
@@ -1086,7 +1241,13 @@ impl<'a> Router<'a> {
             );
             groups.entry(key).or_default().push(i);
         }
-        let g = self.cfg.power_stub_mm;
+        let g = self.cfg.grid_mm;
+        let stub = self.cfg.power_stub_mm;
+        // The bus sits at least a full pin exit out from the pin column so
+        // every tap leaves its pin straight for >= `min_pin_exit_steps` grid
+        // steps (rule #1); it then steps out one grid at a time, hugging the
+        // component as closely as a clean column allows (rule #2).
+        let base_off = self.cfg.min_pin_exit_mm().max(stub);
         for ((_, dirx, _), mut members) in groups {
             if members.len() < 2 {
                 continue;
@@ -1102,12 +1263,12 @@ impl<'a> Router<'a> {
             let ymin = eps[members[0]].pos.1;
             let ymax = eps[*members.last().unwrap()].pos.1;
             let placed_excl: Vec<usize> = members.iter().map(|&i| eps[i].placed).collect();
-            for k in 1..=6 {
-                let bus_x = round4(px + dirx as f64 * g * k as f64);
+            for step in 0..=8 {
+                let bus_x = round4(px + dirx as f64 * (base_off + step as f64 * g));
                 let sym_y = if down {
-                    round4(ymax + g)
+                    round4(ymax + stub)
                 } else {
-                    round4(ymin - g)
+                    round4(ymin - stub)
                 };
                 let (bus_top, bus_bot) = if down { (ymin, sym_y) } else { (sym_y, ymax) };
                 let bus = vec![(bus_x, bus_top), (bus_x, bus_bot)];
@@ -1159,9 +1320,11 @@ impl<'a> Router<'a> {
                 continue;
             }
             let name = net.name.clone();
-            let down = net.class == NetClass::Ground;
+            // Grounds and negative rails hang their symbols downward; positive
+            // rails point up (rule #3 potential ordering).
+            let down = power_points_down(&name, net.class);
             let eps = self.net_endpoints(net);
-            let eps = self.collapse_stacked_pins(eps, &name, !down);
+            let eps = self.collapse_stacked_pins(eps, &name, !down, true);
             let aligned = self.power_align_targets(&eps, down);
             // Group non-adjacent same-net pins of one IC edge under a single
             // shared symbol (a short bus joins them). Pins the merge served are
@@ -1175,11 +1338,12 @@ impl<'a> Router<'a> {
                 let mut att = power_attachment(self.cfg, ep.pos, ep.dir, down, 0.0, 0.0);
                 let mut found = false;
 
-                // Aligned candidates first (row target), then free retries
-                // (including a shortened -1.27 mm elbow that escapes a
-                // condemned canonical column), then jogs for vertical pins.
+                // Aligned candidates first (row target), then free retries at
+                // one-grid-step increments outward (never a shortened elbow —
+                // the exit stays >= `min_pin_exit_steps`), then jogs for
+                // vertical pins.
                 let hs = [
-                    0.0, 2.54, 5.08, 7.62, 10.16, 12.7, 15.24, 17.78, 20.32, -1.27,
+                    0.0, 1.27, 2.54, 3.81, 5.08, 7.62, 10.16, 12.7, 15.24, 17.78, 20.32,
                 ];
                 let mut attempts: Vec<(f64, f64)> = Vec::new();
                 if let Some(&ty) = aligned.get(&index) {
@@ -1215,21 +1379,37 @@ impl<'a> Router<'a> {
                         }
                     }
                 }
-                let mut best_crossings = usize::MAX;
+                // Selection favours HUGGING the component (rule #2): among the
+                // clean candidates the branch column closest to the pin wins, so
+                // a VDD/GND tap peels off right beside the part instead of being
+                // pushed out past the global labels. A same-net alignment row
+                // (rule #3) is honoured first — the symbol lands on the shared
+                // potential ordinate — then the closest column, then (only as a
+                // tie-break) the fewest frank crossings and the shortest path.
+                // Frank crossings are electrically harmless, so hugging is
+                // allowed to accept one rather than flee to a distant column.
+                let target = aligned.get(&index).copied();
+                let mut best_key: Option<(f64, f64, usize, f64)> = None;
                 for cand in &cands {
                     let gbox = power_symbol_graphic_box(&name, cand.symbol_at, cand.down);
-                    if self.path_ok(&cand.path, &name, &[ep.placed])
-                        && self.graphic_box_clear(&gbox, &name)
+                    if !self.path_ok(&cand.path, &name, &[ep.placed])
+                        || !self.graphic_box_clear(&gbox, &name)
                     {
-                        let crossings = self.reg.count_crossings(&cand.path);
-                        if crossings < best_crossings {
-                            att = cand.clone();
-                            best_crossings = crossings;
-                            found = true;
-                        }
-                        if best_crossings == 0 {
-                            break;
-                        }
+                        continue;
+                    }
+                    let miss = target.map_or(0.0, |ty| (cand.symbol_at.1 - ty).abs());
+                    let hug = (cand.symbol_at.0 - ep.pos.0).abs();
+                    let key = (
+                        miss,
+                        hug,
+                        self.reg.count_crossings(&cand.path),
+                        path_length_mm(&cand.path),
+                    );
+                    let better = best_key.as_ref().is_none_or(|b| key < *b);
+                    if better {
+                        best_key = Some(key);
+                        att = cand.clone();
+                        found = true;
                     }
                 }
                 if !found {
@@ -1240,7 +1420,8 @@ impl<'a> Router<'a> {
                     // rails is a netlist corruption, not a cosmetic issue.
                     let mut extended: Vec<Attachment> = Vec::new();
                     for h in [
-                        -1.27, 0.0, 2.54, 5.08, 7.62, 10.16, 12.7, 15.24, 17.78, 20.32, 25.4, 30.48,
+                        0.0, 1.27, 2.54, 3.81, 5.08, 7.62, 10.16, 12.7, 15.24, 17.78, 20.32, 25.4,
+                        30.48,
                     ] {
                         for v in [0.0, 2.54, 5.08, 7.62, 10.16, 12.7, 15.24, 20.32] {
                             extended.push(power_attachment(self.cfg, ep.pos, ep.dir, down, h, v));
@@ -1344,12 +1525,21 @@ impl<'a> Router<'a> {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
             });
+            // By-potential alignment binds same-potential symbols on a common
+            // ordinate across the whole cluster width, so a functional band of
+            // grounds (or of rails) reads as one horizontal line regardless of
+            // how far apart their pins sit; without it symbols only align when
+            // their columns fall within `power_align_max_dx_mm`. The dy band
+            // still caps how far a stub may stretch to reach the shared row.
+            let max_dx = if cfg.align_power_by_potential {
+                f64::INFINITY
+            } else {
+                cfg.power_align_max_dx_mm
+            };
             let mut rows: Vec<Vec<(usize, f64, f64)>> = Vec::new();
             for item in band {
                 match rows.last_mut() {
-                    Some(cur) if item.1 - cur.last().unwrap().1 <= cfg.power_align_max_dx_mm => {
-                        cur.push(item)
-                    }
+                    Some(cur) if item.1 - cur.last().unwrap().1 <= max_dx => cur.push(item),
                     _ => rows.push(vec![item]),
                 }
             }
@@ -1491,8 +1681,20 @@ impl<'a> Router<'a> {
             union_opt(&mut out, &full);
         }
         let mut out = out?;
-        // The upright caps' rail/ground symbols sit on the caps' X column.
+        // The upright caps' rail/ground symbols sit on the caps' X column. The
+        // relegated `PWR_FLAG` column is stacked in that same X band but belongs
+        // to the ERC band (`flag_region`), not here: skip any power symbol whose
+        // connection point falls inside it, otherwise the decoupling band would
+        // swallow the flag stack and the two zones would overlap.
         for (name, at, down) in &self.out.power_symbols {
+            if let Some(fr) = self.flag_region
+                && fr.x1 - EPS <= at.0
+                && at.0 <= fr.x2 + EPS
+                && fr.y1 - EPS <= at.1
+                && at.1 <= fr.y2 + EPS
+            {
+                continue;
+            }
             if at.0 >= lo - EPS && at.0 <= hi + EPS {
                 out.union(&power_symbol_graphic_box(name, *at, *down));
             }
@@ -1654,12 +1856,71 @@ impl<'a> Router<'a> {
         // right column stacks Decoupling over ERC. Every cell fully encloses
         // its content (margins added), guaranteeing nothing overflows. ---
         let func_right = func.map(|f| f.x2).unwrap_or(util_left);
-        // Column seam centered between the two contents; each cell edge is then
-        // pulled back so it fully contains its OWN content. With a clear channel
-        // the two edges meet on a shared line (the tidy grid); when a stray
-        // functional stub reaches into the channel the cells overlap by that
-        // small amount instead of clipping it — nothing ever overflows a zone.
-        let x_seam = (func_right + util_left) / 2.0;
+
+        // Anchor extents for the vertical seam. A value text overhangs its
+        // glyph, but the electrical anchor (a label's connection point, a
+        // symbol's pin, a component body) must land in its own cell. Track the
+        // rightmost functional anchor and the leftmost utility glyph so a
+        // functional net label placed level with the utility column (its anchor
+        // inside the column's X band) still falls in the functional cell. A
+        // power symbol/flag is utility when its connection point sits inside the
+        // decoupling or ERC content box; every local/global/hier label is a
+        // functional annotation (the utility column carries only power symbols
+        // and flags).
+        let in_util = |at: Point| -> bool {
+            [decoupling, erc].into_iter().flatten().any(|u| {
+                at.0 >= u.x1 - EPS && at.0 <= u.x2 + EPS && at.1 >= u.y1 - EPS && at.1 <= u.y2 + EPS
+            })
+        };
+        let mut func_ax2 = f64::NEG_INFINITY;
+        let mut util_ax1 = f64::INFINITY;
+        for p in &self.model.placed {
+            let raw = raw_box(&self.design.comps[p.comp].geom, p.at, p.rotation, p.mirror);
+            if p.relegated {
+                util_ax1 = util_ax1.min(raw.x1);
+            } else {
+                func_ax2 = func_ax2.max(raw.x2);
+            }
+        }
+        for (_, at, _) in &self.out.power_symbols {
+            if in_util(*at) {
+                util_ax1 = util_ax1.min(at.0);
+            } else {
+                func_ax2 = func_ax2.max(at.0);
+            }
+        }
+        for &at in &self.out.pwr_flags {
+            if in_util(at) {
+                util_ax1 = util_ax1.min(at.0);
+            } else {
+                func_ax2 = func_ax2.max(at.0);
+            }
+        }
+        for (_, at, _) in &self.out.net_labels {
+            func_ax2 = func_ax2.max(at.0);
+        }
+        for (_, at, _, _) in &self.out.global_labels {
+            func_ax2 = func_ax2.max(at.0);
+        }
+        for (_, _, at, _) in &self.out.hier_labels {
+            func_ax2 = func_ax2.max(at.0);
+        }
+
+        // Vertical seam between the functional column (left) and the utility
+        // column (right). It defaults to the midpoint of the free space between
+        // the two content boxes, but if a functional anchor sits right of that
+        // midpoint (a signal net label placed level with the utility column) the
+        // seam slides into the gap between that anchor and the leftmost utility
+        // glyph, keeping the label in the functional cell (its wide text may
+        // overhang, which is tolerated). The cells ABUT on this seam (optionally
+        // parted by `zone_gap_mm`) and never grow past it, so the rectangles stay
+        // mutually DISJOINT — two zone outlines never overlap.
+        let x_seam_plain = (func_right + util_left) / 2.0;
+        let x_seam = if func_ax2 > x_seam_plain && func_ax2 < util_ax1 {
+            (func_ax2 + util_ax1) / 2.0
+        } else {
+            x_seam_plain
+        };
         let gx = self.cfg.zone_gap_mm.min((util_left - func_right).max(0.0));
 
         // Outer rectangle, shared by every cell; edges snapped outward.
@@ -1689,8 +1950,8 @@ impl<'a> Router<'a> {
         let x_hi = out_hi(util_right + m);
         let y_lo = out_lo(top - m);
         let y_hi = out_hi(bot + m);
-        let f_x2 = round4((x_seam - gx / 2.0).max(func_right));
-        let u_x1 = round4((x_seam + gx / 2.0).min(util_left));
+        let f_x2 = round4(x_seam - gx / 2.0);
+        let u_x1 = round4(x_seam + gx / 2.0);
 
         if func.is_some() {
             self.push_zone(
@@ -1705,9 +1966,10 @@ impl<'a> Router<'a> {
         }
         match (decoupling, erc) {
             (Some(d), Some(e)) => {
-                // Decoupling sits above ERC: split the column on a row border
-                // centered between the two bands, each edge pulled back to
-                // contain its own band (same containment rule as the column).
+                // Decoupling sits above ERC: split the column on a row seam
+                // centered in the free space between the two bands. The two
+                // cells abut on this seam (never expanding past it), so the
+                // Decoupling and ERC rectangles stay disjoint.
                 let y_seam = (d.y2 + e.y1) / 2.0;
                 let gy = self.cfg.zone_gap_mm.min((e.y1 - d.y2).max(0.0));
                 self.push_zone(
@@ -1715,14 +1977,14 @@ impl<'a> Router<'a> {
                         x1: u_x1,
                         y1: y_lo,
                         x2: x_hi,
-                        y2: round4((y_seam - gy / 2.0).max(d.y2)),
+                        y2: round4(y_seam - gy / 2.0),
                     },
                     "Decoupling",
                 );
                 self.push_zone(
                     BBox {
                         x1: u_x1,
-                        y1: round4((y_seam + gy / 2.0).min(e.y1)),
+                        y1: round4(y_seam + gy / 2.0),
                         x2: x_hi,
                         y2: y_hi,
                     },
@@ -1867,11 +2129,13 @@ impl<'a> Router<'a> {
                         });
                         self.port_anchored.insert(name);
                     } else {
-                        // Label sits left of the block; the stub reaches it
-                        // from the right, so text reads outward (leftward).
-                        self.out.net_labels.push((name.clone(), end, 180));
+                        // Local net label left of the block: the stub reaches it
+                        // from the right, so the label reads back over the stub
+                        // (text above the wire, wire running on to the block).
+                        let rot = net_label_rotation(false, 180);
+                        self.out.net_labels.push((name.clone(), end, rot));
                         self.reg.label_boxes.push(LabelBox {
-                            bbox: label_text_box(&name, end, 180),
+                            bbox: label_text_box(&name, end, rot),
                             net: name,
                             also: Vec::new(),
                         });
@@ -1893,11 +2157,13 @@ impl<'a> Router<'a> {
                         });
                         self.port_anchored.insert(name);
                     } else {
-                        // Label sits right of the block; the stub reaches it
-                        // from the left, so text reads outward (rightward).
-                        self.out.net_labels.push((name.clone(), end, 0));
+                        // Local net label right of the block: the stub reaches
+                        // it from the left, so the label reads back over the stub
+                        // (text above the wire, wire running on to the block).
+                        let rot = net_label_rotation(false, 0);
+                        self.out.net_labels.push((name.clone(), end, rot));
                         self.reg.label_boxes.push(LabelBox {
-                            bbox: label_text_box(&name, end, 0),
+                            bbox: label_text_box(&name, end, rot),
                             net: name,
                             also: Vec::new(),
                         });
@@ -1955,9 +2221,12 @@ impl<'a> Router<'a> {
                     .push((name.clone(), direction, (x, y), 0));
                 self.out.wires.push(vec![(x, y), end]);
                 self.reg.register_path(&[(x, y), end], &name);
-                // Stub reaches the homonym label from the port side (right);
-                // its text reads outward, away from the wire.
-                self.out.net_labels.push((name.clone(), end, 180));
+                // The homonym is a local net label: it reads back over its stub
+                // (text above the wire) while the sibling hierarchical label
+                // above keeps the outward port reading.
+                self.out
+                    .net_labels
+                    .push((name.clone(), end, net_label_rotation(false, 180)));
             } else {
                 let x = cfg.snap(content.x1 - cfg.port_column_mm);
                 let y = cfg.snap(start_y + left_i as f64 * cfg.port_pitch_mm);
@@ -1968,9 +2237,12 @@ impl<'a> Router<'a> {
                     .push((name.clone(), direction, (x, y), 180));
                 self.out.wires.push(vec![(x, y), end]);
                 self.reg.register_path(&[(x, y), end], &name);
-                // Stub reaches the homonym label from the port side (left);
-                // its text reads outward, away from the wire.
-                self.out.net_labels.push((name.clone(), end, 0));
+                // The homonym is a local net label: it reads back over its stub
+                // (text above the wire) while the sibling hierarchical label
+                // above keeps the outward port reading.
+                self.out
+                    .net_labels
+                    .push((name.clone(), end, net_label_rotation(false, 0)));
             }
         }
     }
@@ -2057,6 +2329,29 @@ mod tests {
     }
 
     #[test]
+    fn net_label_rotation_flips_locals_keeps_ports() {
+        // #4: a global/hierarchical label keeps its outward (port) reading; a
+        // local net label reads back over its wire — the outward rotation
+        // flipped by 180°.
+        for outward in [0, 180] {
+            assert_eq!(net_label_rotation(true, outward), outward);
+            assert_eq!(
+                net_label_rotation(false, outward),
+                (outward + 180).rem_euclid(360)
+            );
+        }
+        // A local label at `at` on a rightward stub (wire runs +x from the
+        // anchor) gets rotation 180, whose text box lies to the LEFT of the
+        // anchor — over the wire — not off its far end.
+        let at = (50.0, 20.0);
+        let over = label_text_box("BUS", at, net_label_rotation(false, 0));
+        assert!(
+            over.x2 <= at.0 + 1e-6 && over.x1 < at.0,
+            "text overhangs the wire"
+        );
+    }
+
+    #[test]
     fn frank_crossing_is_tolerated_but_touch_is_forbidden() {
         let h = seg(0.0, 0.0, 10.0, 0.0, "A");
         let v_cross = seg(5.0, -5.0, 5.0, 5.0, "B");
@@ -2086,6 +2381,32 @@ mod tests {
         let b = power_attachment(&cfg, (10.0, 10.0), (1.0, 0.0), false, 0.0, 0.0);
         assert_eq!(b.path.len(), 3);
         assert_eq!(b.symbol_at, (12.54, 7.46));
+    }
+
+    #[test]
+    fn power_potential_orders_rails_ground_negatives() {
+        // Positive rail outranks ground outranks negative rail.
+        assert_eq!(power_potential_rank("VDD", NetClass::Power), 1);
+        assert_eq!(power_potential_rank("VCC", NetClass::Power), 1);
+        assert_eq!(power_potential_rank("+5V", NetClass::Power), 1);
+        assert_eq!(power_potential_rank("GND", NetClass::Ground), 0);
+        assert_eq!(power_potential_rank("VSS", NetClass::Ground), 0);
+        assert_eq!(power_potential_rank("VEE", NetClass::Power), -1);
+        assert_eq!(power_potential_rank("-12V", NetClass::Power), -1);
+        assert_eq!(power_potential_rank("V-", NetClass::Power), -1);
+        assert!(
+            power_potential_rank("VDD", NetClass::Power)
+                > power_potential_rank("GND", NetClass::Ground)
+        );
+        assert!(
+            power_potential_rank("GND", NetClass::Ground)
+                > power_potential_rank("VEE", NetClass::Power)
+        );
+        // Grounds and negative rails hang down; positive rails point up.
+        assert!(power_points_down("GND", NetClass::Ground));
+        assert!(power_points_down("VEE", NetClass::Power));
+        assert!(!power_points_down("VDD", NetClass::Power));
+        assert!(!power_points_down("+3V3", NetClass::Power));
     }
 
     #[test]

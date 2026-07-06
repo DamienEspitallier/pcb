@@ -562,44 +562,84 @@ mod tests {
     }
 
     #[test]
-    fn labels_read_outward_from_their_pin() {
-        // #3: a label at the end of a stub faces its pin — the connection point
-        // (and a global label's flag) toward the wire, the text reading AWAY
-        // from the pin. Regression: labels used to be flipped 180° (text over
-        // the wire, the flag pointing out of the sheet).
+    fn global_labels_read_outward_from_their_pin() {
+        // A global/hierarchical label is a directional port: its connection
+        // point (and its flag) faces the wire, the text reading AWAY from the
+        // pin, off the wire's terminal end. (Local net labels do the opposite,
+        // see `local_net_labels_read_back_over_their_wire`.)
         let out = generate_schematic(&decoupled_adc(), &SchOptions::new("lbl")).unwrap();
         let c = &out.files[0].content;
         let segs = wire_segments(c);
         let mut checked = 0;
-        for kind in ["global_label", "label"] {
-            for (name, x, y, rot) in labels_of(c, kind) {
-                // Direction of the wire leaving the label anchor (toward the pin).
-                let Some(dir) = segs.iter().find_map(|(a, b)| {
-                    if (a.0 - x).abs() < 1e-3 && (a.1 - y).abs() < 1e-3 {
-                        Some((b.0 - a.0, b.1 - a.1))
-                    } else if (b.0 - x).abs() < 1e-3 && (b.1 - y).abs() < 1e-3 {
-                        Some((a.0 - b.0, a.1 - b.1))
-                    } else {
-                        None
-                    }
-                }) else {
-                    continue;
-                };
-                if dir.0.abs() <= dir.1.abs() {
-                    continue; // vertical stub: no horizontal reading to check
+        for (name, x, y, rot) in labels_of(c, "global_label") {
+            // Direction of the wire leaving the label anchor (toward the pin).
+            let Some(dir) = segs.iter().find_map(|(a, b)| {
+                if (a.0 - x).abs() < 1e-3 && (a.1 - y).abs() < 1e-3 {
+                    Some((b.0 - a.0, b.1 - a.1))
+                } else if (b.0 - x).abs() < 1e-3 && (b.1 - y).abs() < 1e-3 {
+                    Some((a.0 - b.0, a.1 - b.1))
+                } else {
+                    None
                 }
-                // Text extends +x at rot 0, -x at rot 180 — always opposite the
-                // wire, which runs toward the pin.
-                let text_dir = if rot == 0 { 1.0 } else { -1.0 };
-                assert!(
-                    text_dir * dir.0 < 0.0,
-                    "{kind} {name}: reads into its wire (rot {rot}, wire dx {})",
-                    dir.0
-                );
-                checked += 1;
+            }) else {
+                continue;
+            };
+            if dir.0.abs() <= dir.1.abs() {
+                continue; // vertical stub: no horizontal reading to check
             }
+            // Text extends +x at rot 0, -x at rot 180 — always opposite the
+            // wire, which runs toward the pin.
+            let text_dir = if rot == 0 { 1.0 } else { -1.0 };
+            assert!(
+                text_dir * dir.0 < 0.0,
+                "global_label {name}: reads into its wire (rot {rot}, wire dx {})",
+                dir.0
+            );
+            checked += 1;
         }
-        assert!(checked > 0, "expected a horizontal label to check");
+        assert!(checked > 0, "expected a horizontal global label to check");
+    }
+
+    #[test]
+    fn local_net_labels_read_back_over_their_wire() {
+        // #4: a local net label names the conductor it sits on. Its text must
+        // overhang the wire (the wire runs UNDER the text and on past it toward
+        // the circuit), not hang off the terminal end like a port. So the text
+        // reads in the SAME direction the wire runs from the anchor — the
+        // opposite of a global label.
+        let out = generate_schematic(&digital_bus(), &SchOptions::new("bus")).unwrap();
+        let c = &out.files[0].content;
+        let segs = wire_segments(c);
+        let mut checked = 0;
+        for (name, x, y, rot) in labels_of(c, "label") {
+            let Some(dir) = segs.iter().find_map(|(a, b)| {
+                if (a.0 - x).abs() < 1e-3 && (a.1 - y).abs() < 1e-3 {
+                    Some((b.0 - a.0, b.1 - a.1))
+                } else if (b.0 - x).abs() < 1e-3 && (b.1 - y).abs() < 1e-3 {
+                    Some((a.0 - b.0, a.1 - b.1))
+                } else {
+                    None
+                }
+            }) else {
+                continue;
+            };
+            if dir.0.abs() <= dir.1.abs() {
+                continue; // vertical stub: horizontal reading not applicable
+            }
+            // Text extends +x at rot 0, -x at rot 180 — SAME sign as the wire
+            // leaving the anchor, so the text lies over the conductor.
+            let text_dir = if rot == 0 { 1.0 } else { -1.0 };
+            assert!(
+                text_dir * dir.0 > 0.0,
+                "local label {name}: reads off its wire end instead of over it (rot {rot}, wire dx {})",
+                dir.0
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "expected a horizontal local net label to check"
+        );
     }
 
     #[test]
@@ -643,21 +683,31 @@ mod tests {
         // Functional spans the full height; the outer top/bottom are shared.
         assert!(close(func.1, top.1), "functional/decoupling share the top");
         assert!(close(func.3, bot.3), "functional/erc share the bottom");
-        // Column and row seams abut with NO gap: cells touch on a shared edge
-        // (clear channel) or overlap slightly (a stray stub reaching in), but
-        // never leave a hole between them.
+        // #5: column and row seams are SHARED EDGES — the cells abut exactly,
+        // never overlapping (the earlier code let a stray stub overlap the
+        // cells; the zones must now be mutually disjoint) and never leaving a
+        // hole. With the default zero channel each seam is a single line.
         assert!(
-            func.2 >= top.0 - 0.01,
-            "gap between functional and utility column ({} vs {})",
+            close(func.2, top.0),
+            "functional/utility column seam is not a shared edge ({} vs {})",
             func.2,
             top.0
         );
         assert!(
-            top.3 >= bot.1 - 0.01,
-            "gap between decoupling and erc ({} vs {})",
+            close(top.3, bot.1),
+            "decoupling/erc row seam is not a shared edge ({} vs {})",
             top.3,
             bot.1
         );
+        // No pair of zone rectangles overlaps (positive-area intersection).
+        let overlaps = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+            (a.2.min(b.2) - a.0.max(b.0)) > 0.01 && (a.3.min(b.3) - a.1.max(b.1)) > 0.01
+        };
+        for (i, a) in z.iter().enumerate() {
+            for b in &z[i + 1..] {
+                assert!(!overlaps(*a, *b), "zones {a:?} and {b:?} overlap");
+            }
+        }
     }
 
     #[test]

@@ -90,6 +90,13 @@ pub struct SchConfig {
     /// (MCU, big connector...); its signal nets break into net labels instead
     /// of real wires. Applied per component, not per net.
     pub hub_pin_count_threshold: usize,
+    /// Analog wiring break threshold: an analog net is wired as a continuous
+    /// wire and is allowed to break into a label only when it lands on a
+    /// symbol with more visible pins than this (a many-pin part where a
+    /// continuous wire would be unreadable). Smaller symbols keep the wire.
+    /// A net leaving directly on a hierarchical/global port always keeps its
+    /// wire regardless of this threshold.
+    pub analog_break_pin_count: usize,
     /// Collision margin added around component bounding boxes.
     pub component_pad_mm: f64,
     /// Content margins of a sheet.
@@ -142,6 +149,7 @@ impl Default for SchConfig {
             crystal_gap_mm: 8.89,
             direct_wire_max_mm: 50.8,
             hub_pin_count_threshold: 10,
+            analog_break_pin_count: 8,
             component_pad_mm: 1.27,
             margin_left_mm: 25.4,
             margin_top_mm: 22.86,
@@ -214,6 +222,10 @@ mod tests {
         assert_eq!(cfg.paper, Paper::A3);
         // Untouched fields keep defaults.
         assert_eq!(cfg.stub_mm, 5.08);
+        assert_eq!(cfg.analog_break_pin_count, 8);
+        // The analog break threshold is overridable like any other field.
+        let over: SchConfig = toml_str_subset("analog-break-pin-count = 16\n");
+        assert_eq!(over.analog_break_pin_count, 16);
     }
 
     fn toml_str_subset(s: &str) -> SchConfig {

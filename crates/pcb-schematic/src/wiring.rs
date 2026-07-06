@@ -478,13 +478,23 @@ impl Router<'_> {
         if self.overlaps_same_net(path, net) {
             return false;
         }
+        // A digital tree dodges the full predicted power corridor (the
+        // conservative max-stretch keepout). An analog net keeps its
+        // continuous wire and only respects the MINIMAL power footprint (the
+        // symbol graphic zone at the shortest attachment): the wire may run
+        // through the over-conservative stretch tail — the power stub, routed
+        // later, re-plans around the committed wire — but never where a power
+        // symbol will actually be drawn (that would force the stub to cross
+        // the wire).
+        let block_zone = if self.analog_wiring {
+            crate::texts::CorridorZone::Graphic
+        } else {
+            crate::texts::CorridorZone::Corridor
+        };
         for w in path.windows(2) {
             let seg = mk_seg(w[0], w[1], net);
             for c in &self.corridors {
-                if c.zone == crate::texts::CorridorZone::Corridor
-                    && c.net != net
-                    && seg_intersects_box(&seg, &c.bbox)
-                {
+                if c.zone == block_zone && c.net != net && seg_intersects_box(&seg, &c.bbox) {
                     return false;
                 }
             }
@@ -632,14 +642,24 @@ impl Router<'_> {
         out
     }
 
-    /// Wire an endpoint subset as a tree of real wires: seed = the closest
-    /// routable pair, then greedy joins of the remaining endpoints (closest
-    /// to the tree first) by tee/L/direct wire — real junction at every
-    /// tee. Returns the endpoints actually wired (subset of the input); the
-    /// others fall back to labels. **No rollback here** — the caller
-    /// snapshots.
-    pub(crate) fn wire_group_tree(&mut self, net_name: &str, subset: &[Endpoint]) -> Vec<Endpoint> {
-        let tree_seg_start = self.reg.segs.len();
+    /// Wire an endpoint subset as a tree of real wires: seed = a routable
+    /// pair, then greedy joins of the remaining endpoints (closest to the
+    /// tree first) by tee/L/direct wire — real junction at every tee.
+    /// Returns the endpoints actually wired (subset of the input); the others
+    /// fall back to labels. **No rollback here** — the caller snapshots.
+    ///
+    /// With `best_coverage` the seed pair is chosen to maximize the number of
+    /// endpoints reached (each candidate seed is grown in a sandbox and rolled
+    /// back, then the best is replayed) — analog nets want the whole net on a
+    /// single continuous wire, so a greedy seed that dead-ends after two pins
+    /// is not good enough. Without it the first routable seed wins (the
+    /// original, cheaper behavior kept for digital hub trees).
+    pub(crate) fn wire_group_tree(
+        &mut self,
+        net_name: &str,
+        subset: &[Endpoint],
+        best_coverage: bool,
+    ) -> Vec<Endpoint> {
         let mut list: Vec<Endpoint> = subset.to_vec();
         list.sort_by(|a, b| {
             natord::compare(
@@ -649,7 +669,7 @@ impl Router<'_> {
             .then_with(|| a.pad.cmp(&b.pad))
         });
 
-        // Seed: pairs by increasing Manhattan distance.
+        // Seed candidates: pairs by increasing Manhattan distance.
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         for i in 0..list.len() {
             for j in i + 1..list.len() {
@@ -663,8 +683,47 @@ impl Router<'_> {
                 + (list[q.1].pos.1 - list[q.0].pos.1).abs();
             dp.partial_cmp(&dq).unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        if !best_coverage {
+            let idx = self.grow_tree(net_name, &list, &pairs);
+            return idx.into_iter().map(|i| list[i].clone()).collect();
+        }
+
+        // Best coverage: grow from each seed in a sandbox, keep the seed
+        // reaching the most endpoints (earliest seed breaks ties), replay it.
+        let mut best_seed: Option<(usize, usize)> = None;
+        let mut best_len = 0usize;
+        for &seed in &pairs {
+            let undo = self.snapshot_wiring();
+            let idx = self.grow_tree(net_name, &list, std::slice::from_ref(&seed));
+            if idx.len() > best_len {
+                best_len = idx.len();
+                best_seed = Some(seed);
+            }
+            self.rollback_wiring(&undo);
+            if best_len == list.len() {
+                break;
+            }
+        }
+        let Some(seed) = best_seed else {
+            return Vec::new();
+        };
+        let idx = self.grow_tree(net_name, &list, std::slice::from_ref(&seed));
+        idx.into_iter().map(|i| list[i].clone()).collect()
+    }
+
+    /// Grow one real-wire tree from the first routable pair in `seed_pairs`,
+    /// then greedily join the remaining endpoints. Returns the sorted indices
+    /// (into `list`) actually wired; wires/junctions are committed to `self`.
+    fn grow_tree(
+        &mut self,
+        net_name: &str,
+        list: &[Endpoint],
+        seed_pairs: &[(usize, usize)],
+    ) -> Vec<usize> {
+        let tree_seg_start = self.reg.segs.len();
         let mut wired_idx: Vec<usize> = Vec::new();
-        'seed: for &(i, j) in &pairs {
+        'seed: for &(i, j) in seed_pairs {
             for cand in tree_pair_candidates(
                 self.cfg,
                 (list[i].pos, list[i].dir),
@@ -738,7 +797,7 @@ impl Router<'_> {
             }
         }
         wired_idx.sort_unstable();
-        wired_idx.into_iter().map(|i| list[i].clone()).collect()
+        wired_idx
     }
 
     /// No segment (same net included) may cross the box of a text about to
@@ -765,14 +824,29 @@ impl Router<'_> {
     /// by the segment. Fallback: a hanging branch (stub + junction) carrying
     /// the label — never a vertical label. Returns false when no clean spot
     /// exists.
-    pub(crate) fn place_tree_net_label(&mut self, net_name: &str, tree_seg_start: usize) -> bool {
+    pub(crate) fn place_tree_net_label(
+        &mut self,
+        net_name: &str,
+        tree_seg_start: usize,
+        allow_branch: bool,
+    ) -> bool {
         let g = self.cfg.grid_mm;
         let w = label_text_width(net_name);
         let snap = |v: f64| round4((v / g).round() * g);
+        // A cosmetic annotation (`!allow_branch`) may sit on a segment shorter
+        // than the text and let the label overhang one end (clearance still
+        // enforced) — the continuous analog backbone rarely offers a full
+        // text-width straight run. A functional label must stay underlined.
+        let min_seg = if allow_branch {
+            w
+        } else {
+            self.cfg.label_elbow_mm
+        };
+        let overhang = if allow_branch { 1.27 } else { w };
         let mut horiz: Vec<(f64, f64, f64, f64)> = self.reg.segs[tree_seg_start..]
             .iter()
             .filter(|s| s.net == net_name)
-            .filter(|s| (s.y1 - s.y2).abs() < EPS && (s.x2 - s.x1).abs() >= w - EPS)
+            .filter(|s| (s.y1 - s.y2).abs() < EPS && (s.x2 - s.x1).abs() >= min_seg - EPS)
             .map(|s| (s.x1, s.y1, s.x2, s.y2))
             .collect();
         horiz.sort_by(|p, q| {
@@ -797,9 +871,14 @@ impl Router<'_> {
                 anchors.push(((round4(x), y), 0));
                 x = round4(x - g);
             }
+            // Overhang anchors at the segment ends (annotation mode only).
+            if !allow_branch {
+                anchors.push(((round4(xhi), y), 180));
+                anchors.push(((round4(xlo), y), 0));
+            }
             for (at, rotation) in anchors {
                 let bbox = crate::route::label_text_box(net_name, at, rotation);
-                if bbox.x1 < xlo - 1.27 - EPS || bbox.x2 > xhi + 1.27 + EPS {
+                if bbox.x1 < xlo - overhang - EPS || bbox.x2 > xhi + overhang + EPS {
                     continue;
                 }
                 if !self.label_box_clear(&bbox, net_name, true) {
@@ -820,6 +899,12 @@ impl Router<'_> {
             }
         }
         // Fallback: hanging branch with a real junction at the branch point.
+        // Skipped for a purely cosmetic annotation (`allow_branch == false`):
+        // a branch jutting out of the tree into a neighbor's routing band is
+        // worse than an unnamed continuous wire.
+        if !allow_branch {
+            return false;
+        }
         if let Some((path, at, rotation)) = self.tree_branch_stub(net_name, tree_seg_start) {
             self.out.wires.push(path.clone());
             self.reg.register_path(&path, net_name);
@@ -982,22 +1067,46 @@ impl Router<'_> {
         false
     }
 
-    /// Plan and wire a signal net with real wires when the rule allows:
-    /// Zener info first (all endpoints of one placement group go together,
-    /// hub included), heuristic otherwise (<= 3 endpoints, non-hub side),
-    /// clean route required — labels as before otherwise. A tree that does
-    /// not cover the whole net (or whose net touches child block sheet
-    /// pins) receives ONE net label on the wire; a wired port net gets its
-    /// hierarchical label at the end of a tree stub, never on an edge
-    /// column.
+    /// A signal net is analog (wired continuously) unless the analog/digital
+    /// heuristic marked it digital. Called only on signal nets.
+    fn net_is_analog(&self, sn: usize) -> bool {
+        !self.design.nets[self.model.nets[sn].net].digital
+    }
+
+    /// Plan and wire a signal net with real wires when the rule allows.
+    ///
+    /// **Analog** nets are wired as a single continuous tree over ALL their
+    /// endpoints (best-coverage seeding, never dropping the IC/hub side): the
+    /// engineer wants an uninterrupted wire from the passives to the part.
+    /// The tree carries one *annotation* net label (best effort — a wire that
+    /// covers the whole net keeps flowing even when no clean label spot
+    /// exists), and any endpoint the router could not reach falls back to a
+    /// label (logged).
+    ///
+    /// **Digital** nets keep the historical group behavior: Zener group info
+    /// first (all endpoints of one placement group together, hub included),
+    /// the `<= 3` non-hub heuristic otherwise, one net label when the tree
+    /// does not cover the whole net; hubs break into labels.
     pub(crate) fn plan_and_wire_group(&mut self, sn: usize) {
         let eps = self.eps_for_net(sn);
         let name = self.model.nets[sn].name.clone();
         let port = self.model.nets[sn].port;
         let on_blocks = self.model.nets[sn].on_child_blocks;
         let is_root = self.plan.sheets[self.model.sheet].parent.is_none();
+        let analog = self.net_is_analog(sn);
+        self.analog_wiring = analog;
 
-        let subsets = self.group_subsets(&eps);
+        // Analog: the whole net is one continuous tree. Digital: the group
+        // heuristic (hub-aware) decides the wired subsets.
+        let subsets = if analog {
+            if eps.len() >= 2 {
+                vec![(0..eps.len()).collect::<Vec<usize>>()]
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.group_subsets(&eps)
+        };
         if subsets.is_empty() {
             return;
         }
@@ -1008,7 +1117,7 @@ impl Router<'_> {
             let subset: Vec<Endpoint> = subset_idx.iter().map(|&i| eps[i].clone()).collect();
             let undo = self.snapshot_wiring(); // segs index == tree start
             let tree_seg_start = undo.segs;
-            let wired = self.wire_group_tree(&name, &subset);
+            let wired = self.wire_group_tree(&name, &subset, analog);
             if wired.len() < 2 {
                 self.rollback_wiring(&undo);
                 continue;
@@ -1020,29 +1129,62 @@ impl Router<'_> {
             {
                 hier_on_tree = self.place_tree_hier_label(&name, direction, &wired, tree_seg_start);
             }
-            // A label is required as soon as the tree does not cover the
-            // whole net (homonym labels elsewhere), child block sheet pins
-            // expose it, or a port has no hier label on the tree yet.
+            // A label is functionally required as soon as the tree does not
+            // cover the whole net (homonym labels elsewhere), child block
+            // sheet pins expose it, or a port has no hier label on the tree
+            // yet — its absence would leave the wired part electrically
+            // detached from the labeled remainder.
             let rest_count = eps.len() - wired_count - wired.len();
             let needs_label = rest_count > 0
                 || on_blocks
                 || (port.is_some() && !is_root && !hier_on_tree)
                 || subsets.len() > 1;
-            if needs_label && !self.place_tree_net_label(&name, tree_seg_start) {
-                self.rollback_wiring(&undo);
-                if hier_on_tree {
-                    self.port_anchored.remove(&name);
+            // Analog trees never sprout a jutting branch for their label: a
+            // branch reaching out of the tree walls off a neighbor's routing
+            // band. If the required label cannot sit on the wire itself the
+            // whole tree rolls back to labels (best effort, no interference).
+            if needs_label {
+                if !self.place_tree_net_label(&name, tree_seg_start, !analog) {
+                    self.rollback_wiring(&undo);
+                    if hier_on_tree {
+                        self.port_anchored.remove(&name);
+                    }
+                    continue;
                 }
-                continue;
+            } else if analog {
+                // Full-coverage analog net: a single annotation label names
+                // the wire, best effort — placed only when it fits on a
+                // horizontal tree segment (no jutting branch that would wall
+                // off a neighbor); otherwise the continuous wire is kept as
+                // is (the connection prevails, KiCad auto-names the net).
+                self.place_tree_net_label(&name, tree_seg_start, false);
             }
             wired_count += wired.len();
             for ep in &wired {
                 all_wired.insert(quant(ep.pos));
             }
         }
+        // Analog best-effort: report the endpoints that could not join the
+        // continuous wire and fell back to labels — a fallback the engineer
+        // asked to be told about.
+        if analog && wired_count < eps.len() {
+            let broke_small = eps.iter().any(|e| {
+                !all_wired.contains(&quant(e.pos))
+                    && self.design.comps[self.model.placed[e.placed].comp].visible_pins
+                        <= self.cfg.analog_break_pin_count
+            });
+            if broke_small || wired_count == 0 {
+                self.warnings.push(format!(
+                    "analog net {name}: {}/{} endpoint(s) wired continuously, the rest fell back to labels (no clean route)",
+                    wired_count,
+                    eps.len()
+                ));
+            }
+        }
         if !all_wired.is_empty() {
             self.group_wired.insert(sn, all_wired);
         }
+        self.analog_wiring = false;
     }
 
     /// Direct wire for a facing 2-pin net: straight segment when aligned,

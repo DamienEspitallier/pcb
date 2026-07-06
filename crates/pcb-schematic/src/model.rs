@@ -82,6 +82,16 @@ impl Role {
     }
 }
 
+/// A two-pin passive part for net classification (resistor, capacitor,
+/// inductor, diode, LED, and the decoupling/bulk/pull specializations). A
+/// crystal or any box symbol is *not* passive here.
+pub(crate) fn is_passive_like(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Passive | Role::Decoupling | Role::Bulk | Role::Pull | Role::Led
+    )
+}
+
 /// Preferred side of a satellite relative to its anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -150,6 +160,11 @@ pub struct Comp {
     pub manual: Option<ManualPosition>,
     /// Number of visible (non-hidden, deduplicated by position) pins.
     pub visible_pins: usize,
+    /// The symbol was **synthesized** as a box from the component's pads
+    /// (no `__symbol_value` embedded), i.e. an "unknown" IC drawn as a
+    /// generic box rather than a curated library symbol. Net classification
+    /// treats such endpoints as digital IC boxes.
+    pub synthesized: bool,
 }
 
 /// One net of the design.
@@ -160,6 +175,12 @@ pub struct NetModel {
     pub endpoints: Vec<(usize, String)>,
     /// Driven by a real `power_out`/`output` pin somewhere in the design.
     pub driven: bool,
+    /// Signal net classified **digital** by the analog/digital heuristic (all
+    /// non-passive endpoints are synthesized IC boxes and the only passives
+    /// are pull resistors). Digital nets break into labels; analog nets
+    /// (`digital == false`) are wired continuously. Meaningless (always
+    /// `false`) for power/ground nets.
+    pub digital: bool,
 }
 
 /// The extracted design.
@@ -202,6 +223,7 @@ impl DesignModel {
                 .clone()
                 .with_context(|| format!("component {path_key} has no reference designator"))?;
 
+            let mut synthesized = false;
             let geom = match inst.string_attr(&[ATTR_SYMBOL_VALUE]) {
                 Some(raw) => {
                     let lib_id = lib_ids.lib_id_for(&raw, inst.string_attr(&[ATTR_SYMBOL_PATH]));
@@ -209,6 +231,7 @@ impl DesignModel {
                         .with_context(|| format!("invalid symbol for component {path_key}"))?
                 }
                 None => {
+                    synthesized = true;
                     warnings.push(format!(
                         "component {refdes} ({path_key}) has no symbol; generated a box symbol from its pads"
                     ));
@@ -253,6 +276,7 @@ impl DesignModel {
                 edge_attr: inst.string_attr(&["edge"]),
                 manual: None, // filled below
                 visible_pins: 0,
+                synthesized,
             });
             comps.last_mut().unwrap().visible_pins = visible_pins;
         }
@@ -305,7 +329,8 @@ impl DesignModel {
                 name: name.clone(),
                 class,
                 endpoints,
-                driven: false, // refined below
+                driven: false,  // refined below
+                digital: false, // refined below
             });
         }
 
@@ -332,6 +357,7 @@ impl DesignModel {
             warnings,
         };
         model.classify_roles(sch, cfg);
+        model.classify_digital_nets();
         model.collect_manual_positions(sch);
         Ok(model)
     }
@@ -440,6 +466,77 @@ impl DesignModel {
                 Kind::Other => Role::Other,
             };
         }
+    }
+
+    /// Classify every signal net as digital or analog (verbatim engineer
+    /// heuristic). A signal net is **digital** when, ignoring power/ground:
+    /// * every endpoint that is NOT a passive is a **synthesized** IC box
+    ///   (an "unknown" symbol drawn as a generic box), and there is at least
+    ///   one such box on the net; and
+    /// * the only passives on the net are **pull** resistors (one end on a
+    ///   power/ground rail), at most one pull-up and at most one pull-down.
+    ///
+    /// Everything else is **analog** (best effort) and gets wired
+    /// continuously by the router.
+    fn classify_digital_nets(&mut self) {
+        for ni in 0..self.nets.len() {
+            if self.nets[ni].class != NetClass::Signal {
+                continue;
+            }
+            self.nets[ni].digital = self.net_is_digital(ni);
+        }
+    }
+
+    /// Digital test for one net index (see [`classify_digital_nets`]).
+    fn net_is_digital(&self, ni: usize) -> bool {
+        let mut has_ic_box = false;
+        let mut pull_up = 0usize;
+        let mut pull_down = 0usize;
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        for (ci, _pad) in &self.nets[ni].endpoints {
+            if !seen.insert(*ci) {
+                continue; // a component counts once even with several pads
+            }
+            let comp = &self.comps[*ci];
+            if is_passive_like(comp.role) {
+                // Passives allowed on a digital net are pull resistors only.
+                if comp.role != Role::Pull {
+                    return false;
+                }
+                match self.pull_rail_polarity(*ci, ni) {
+                    Some(true) => pull_up += 1,
+                    Some(false) => pull_down += 1,
+                    None => return false, // "pull" not tied to a rail: not clean
+                }
+            } else {
+                // A non-passive endpoint must be a synthesized IC box.
+                if !comp.synthesized {
+                    return false;
+                }
+                has_ic_box = true;
+            }
+        }
+        if pull_up > 1 || pull_down > 1 {
+            return false;
+        }
+        has_ic_box
+    }
+
+    /// Polarity of a pull resistor's rail end relative to net `ni`: the other
+    /// net of the two-pin component is a power rail (`Some(true)`), a ground
+    /// (`Some(false)`), or neither (`None`).
+    fn pull_rail_polarity(&self, ci: usize, ni: usize) -> Option<bool> {
+        for other in self.comp_net_classes(ci) {
+            if other == ni {
+                continue;
+            }
+            match self.nets[other].class {
+                NetClass::Power => return Some(true),
+                NetClass::Ground => return Some(false),
+                NetClass::Signal => {}
+            }
+        }
+        None
     }
 
     /// Collect manual `# pcb:sch` positions (`comp:` keys only — power
@@ -774,7 +871,120 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{R_SMALL, divider};
+    use crate::testkit::{R_SMALL, add_box, add_r, analog_filter, digital_bus, divider, port_ref};
+
+    fn net<'a>(m: &'a DesignModel, name: &str) -> &'a NetModel {
+        &m.nets[m.net_by_name[name]]
+    }
+
+    #[test]
+    fn synthesized_flag_set_only_for_box_symbols() {
+        let m = DesignModel::build(&analog_filter(), &SchConfig::default()).unwrap();
+        let u1 = &m.comps[m.by_path["U1"]];
+        let rf = &m.comps[m.by_path["RF"]];
+        assert!(u1.synthesized, "symbol-less box is synthesized");
+        assert!(!rf.synthesized, "R_Small carries an embedded symbol");
+    }
+
+    #[test]
+    fn ic_ic_plus_pull_net_is_digital() {
+        // BUS = two synthesized IC boxes + one pull-up -> digital.
+        let m = DesignModel::build(&digital_bus(), &SchConfig::default()).unwrap();
+        assert!(net(&m, "BUS").digital, "IC-IC + pull must classify digital");
+        // The pull resistor itself is recognized.
+        assert_eq!(m.comps[m.by_path["RP"]].role, Role::Pull);
+    }
+
+    #[test]
+    fn rc_filter_net_is_analog() {
+        // FILT = box + series R + shunt cap -> analog (a cap is not a pull).
+        let m = DesignModel::build(&analog_filter(), &SchConfig::default()).unwrap();
+        assert!(!net(&m, "FILT").digital, "an RC filter node is analog");
+        // Series filter R touches no rail -> plain passive, not a pull.
+        assert_eq!(m.comps[m.by_path["RF"]].role, Role::Passive);
+    }
+
+    /// Fresh empty schematic + its root module instance ref.
+    fn scaffold() -> (pcb_sch::Schematic, InstanceRef) {
+        let module = pcb_sch::ModuleRef::from_path(std::path::Path::new("/test.zen"), "<root>");
+        let sch = pcb_sch::Schematic::new();
+        let root = InstanceRef::new(module, vec![]);
+        (sch, root)
+    }
+
+    #[test]
+    fn two_same_polarity_pulls_defeat_digital() {
+        // BUS = box U1 + two pull-UPS to VCC: 2 pull-ups > the 1-per-polarity
+        // budget -> not digital.
+        let (mut sch, root) = scaffold();
+        let mut root_inst = pcb_sch::Instance::module(root.module.clone());
+        let u1 = add_box(&mut sch, &["U1"], &[("BUS", "1"), ("VCC", "2")]);
+        let rp1 = add_r(&mut sch, &["RP1"], "10k");
+        let rp2 = add_r(&mut sch, &["RP2"], "10k");
+        for (n, r) in [("U1", u1), ("RP1", rp1), ("RP2", rp2)] {
+            root_inst.add_child(n.to_string(), r);
+        }
+        sch.add_instance(root.clone(), root_inst);
+        sch.set_root_ref(root);
+        sch.add_net(
+            pcb_sch::Net::new("Net".to_string(), "BUS", 1)
+                .with_port(port_ref(&["U1"], "BUS"))
+                .with_port(port_ref(&["RP1"], "1"))
+                .with_port(port_ref(&["RP2"], "1")),
+        );
+        sch.add_net(
+            pcb_sch::Net::new("Power".to_string(), "VCC", 2)
+                .with_port(port_ref(&["U1"], "VCC"))
+                .with_port(port_ref(&["RP1"], "2"))
+                .with_port(port_ref(&["RP2"], "2")),
+        );
+        sch.assign_reference_designators();
+        let m = DesignModel::build(&sch, &SchConfig::default()).unwrap();
+        assert_eq!(m.comps[m.by_path["RP1"]].role, Role::Pull);
+        assert!(!net(&m, "BUS").digital);
+    }
+
+    #[test]
+    fn real_symbol_endpoint_forces_analog() {
+        // BUS between a CURATED (non-synthesized) part U1 and a box U2, with a
+        // pull. The curated non-passive endpoint makes the net analog.
+        let (mut sch, root) = scaffold();
+        let mut root_inst = pcb_sch::Instance::module(root.module.clone());
+        // U1: embedded symbol, no type/prefix -> role Other, NOT synthesized.
+        let u1 = crate::testkit::add_component(
+            &mut sch,
+            &["U1"],
+            R_SMALL,
+            &[("1", "1"), ("2", "2")],
+            "SENSOR",
+            None,
+        );
+        let u2 = add_box(&mut sch, &["U2"], &[("BUS", "1"), ("VCC", "2")]);
+        let rp = add_r(&mut sch, &["RP"], "10k");
+        for (n, r) in [("U1", u1), ("U2", u2), ("RP", rp)] {
+            root_inst.add_child(n.to_string(), r);
+        }
+        sch.add_instance(root.clone(), root_inst);
+        sch.set_root_ref(root);
+        sch.add_net(
+            pcb_sch::Net::new("Net".to_string(), "BUS", 1)
+                .with_port(port_ref(&["U1"], "1"))
+                .with_port(port_ref(&["U2"], "BUS"))
+                .with_port(port_ref(&["RP"], "1")),
+        );
+        sch.add_net(
+            pcb_sch::Net::new("Power".to_string(), "VCC", 2)
+                .with_port(port_ref(&["U2"], "VCC"))
+                .with_port(port_ref(&["RP"], "2")),
+        );
+        sch.assign_reference_designators();
+        let m = DesignModel::build(&sch, &SchConfig::default()).unwrap();
+        assert!(!m.comps[m.by_path["U1"]].synthesized);
+        assert!(
+            !net(&m, "BUS").digital,
+            "a curated non-box endpoint forces analog"
+        );
+    }
 
     #[test]
     fn model_extracts_components_nets_and_roles() {

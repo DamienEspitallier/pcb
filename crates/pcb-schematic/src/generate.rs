@@ -254,7 +254,43 @@ fn emit_sheet(
 mod tests {
     use super::*;
     use crate::model::ATTR_SYMBOL_VALUE;
-    use crate::testkit::{divider, hierarchical_design};
+    use crate::testkit::{analog_filter, digital_bus, divider, hierarchical_design};
+
+    #[test]
+    fn analog_net_takes_the_continuous_wiring_path() {
+        // The RC-filter node is analog: it is routed by the continuous-wire
+        // engine, which — when a clean route does not exist — reports its
+        // reluctant fallback. That log proves the ANALOG path (not the silent
+        // digital group path) handled FILT.
+        let out = generate_schematic(&analog_filter(), &SchOptions::new("flt")).unwrap();
+        assert!(
+            out.warnings.iter().any(|w| w.contains("analog net FILT")),
+            "FILT must be routed as analog; warnings were {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn digital_net_takes_the_label_path() {
+        // BUS is digital (IC-IC + pull): it never enters the analog
+        // continuous-wire engine, so no analog fallback is ever logged for it.
+        let out = generate_schematic(&digital_bus(), &SchOptions::new("bus")).unwrap();
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("analog net BUS")),
+            "digital BUS must not be routed as analog; warnings were {:?}",
+            out.warnings
+        );
+        assert!(out.files[0].content.contains("\"U1\"") && out.files[0].content.contains("\"U2\""));
+    }
+
+    #[test]
+    fn analog_two_pin_net_is_a_real_wire() {
+        // A 2-pin analog signal net (the divider MID, classified analog) is a
+        // continuous wire, never a label.
+        let out = generate_schematic(&divider(), &SchOptions::new("d")).unwrap();
+        assert_eq!(out.files[0].content.matches("(label \"MID\"").count(), 0);
+        assert!(out.files[0].content.contains("(wire"));
+    }
 
     #[test]
     fn flat_generation_is_deterministic_and_complete() {

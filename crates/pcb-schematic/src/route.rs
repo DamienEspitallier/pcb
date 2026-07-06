@@ -262,6 +262,11 @@ pub(crate) struct Router<'a> {
     pub(crate) group_wired: BTreeMap<usize, BTreeSet<(i64, i64)>>,
     /// Per-net collapsed endpoints (stacked-pin buses emitted once).
     collapsed: BTreeMap<usize, Vec<Endpoint>>,
+    /// Set while wiring an ANALOG net: its continuous wire may cross a
+    /// *predicted* power corridor (the actual power stub, routed later,
+    /// re-plans around the committed wire) — the uninterrupted analog wire
+    /// takes precedence over the conservative keepout.
+    pub(crate) analog_wiring: bool,
 }
 
 /// Route one placed sheet. `flag_nets` = undriven rails whose PWR_FLAG this
@@ -289,6 +294,7 @@ pub fn route_sheet(
         corridors: artifacts.corridors,
         group_wired: BTreeMap::new(),
         collapsed: BTreeMap::new(),
+        analog_wiring: false,
     };
     router.init_registry();
     router.route_signals();

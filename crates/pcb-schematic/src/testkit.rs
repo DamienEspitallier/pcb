@@ -92,6 +92,39 @@ pub fn add_component(
     comp_ref
 }
 
+/// Add a symbol-LESS component: with `__symbol_value` absent the model
+/// synthesizes a box from the pads, i.e. an "unknown" IC box (the flag the
+/// analog/digital classifier keys on). `pins` = (signal, pad).
+pub fn add_box(sch: &mut Schematic, path: &[&str], pins: &[(&str, &str)]) -> InstanceRef {
+    let module = module_ref();
+    let comp_ref = InstanceRef::new(module.clone(), path.iter().map(|s| s.to_string()).collect());
+    let mut comp = Instance::component(module.clone());
+    for (signal, pad) in pins {
+        let port_ref = comp_ref.append(signal.to_string());
+        let mut port = Instance::port(module.clone());
+        port.add_attribute(
+            ATTR_PADS,
+            AttributeValue::Array(vec![AttributeValue::String(pad.to_string())]),
+        );
+        sch.add_instance(port_ref.clone(), port);
+        comp.add_child(signal.to_string(), port_ref);
+    }
+    sch.add_instance(comp_ref.clone(), comp);
+    comp_ref
+}
+
+/// Add a two-pin capacitor-style component (pads 1/2), `type = capacitor`.
+pub fn add_c(sch: &mut Schematic, path: &[&str], value: &str) -> InstanceRef {
+    add_component(
+        sch,
+        path,
+        R_SMALL,
+        &[("1", "1"), ("2", "2")],
+        value,
+        Some("capacitor"),
+    )
+}
+
 pub fn port_ref(comp: &[&str], signal: &str) -> InstanceRef {
     let mut path: Vec<String> = comp.iter().map(|s| s.to_string()).collect();
     path.push(signal.to_string());
@@ -119,6 +152,86 @@ pub fn divider() -> Schematic {
             .with_port(port_ref(&["R2"], "1")),
     );
     sch.add_net(Net::new("Ground".to_string(), "GND", 3).with_port(port_ref(&["R2"], "2")));
+    sch.assign_reference_designators();
+    sch
+}
+
+/// Two synthesized IC boxes joined by signal net `BUS`, plus a pull-up
+/// resistor `RP` (BUS to VCC). BUS = IC-IC + one pull -> DIGITAL.
+pub fn digital_bus() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[("BUS", "1"), ("VCC", "2"), ("GND", "3")],
+    );
+    let u2 = add_box(
+        &mut sch,
+        &["U2"],
+        &[("BUS", "1"), ("VCC", "2"), ("GND", "3")],
+    );
+    let rp = add_r(&mut sch, &["RP"], "10k");
+    root_inst.add_child("U1".to_string(), u1);
+    root_inst.add_child("U2".to_string(), u2);
+    root_inst.add_child("RP".to_string(), rp);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(
+        Net::new("Net".to_string(), "BUS", 1)
+            .with_port(port_ref(&["U1"], "BUS"))
+            .with_port(port_ref(&["U2"], "BUS"))
+            .with_port(port_ref(&["RP"], "1")),
+    );
+    sch.add_net(
+        Net::new("Power".to_string(), "VCC", 2)
+            .with_port(port_ref(&["U1"], "VCC"))
+            .with_port(port_ref(&["U2"], "VCC"))
+            .with_port(port_ref(&["RP"], "2")),
+    );
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 3)
+            .with_port(port_ref(&["U1"], "GND"))
+            .with_port(port_ref(&["U2"], "GND")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
+/// Synthesized box `U1.AIN` behind a series resistor `RF` with a shunt cap
+/// `CF` to GND — an RC input filter. `FILT` (AIN + RF + CF) -> ANALOG.
+pub fn analog_filter() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[("AIN", "1"), ("VCC", "2"), ("GND", "3")],
+    );
+    let rf = add_r(&mut sch, &["RF"], "1k");
+    let cf = add_c(&mut sch, &["CF"], "100pF");
+    root_inst.add_child("U1".to_string(), u1);
+    root_inst.add_child("RF".to_string(), rf);
+    root_inst.add_child("CF".to_string(), cf);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(Net::new("Net".to_string(), "AIN_EXT", 1).with_port(port_ref(&["RF"], "1")));
+    sch.add_net(
+        Net::new("Net".to_string(), "FILT", 2)
+            .with_port(port_ref(&["U1"], "AIN"))
+            .with_port(port_ref(&["RF"], "2"))
+            .with_port(port_ref(&["CF"], "1")),
+    );
+    sch.add_net(Net::new("Power".to_string(), "VCC", 3).with_port(port_ref(&["U1"], "VCC")));
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 4)
+            .with_port(port_ref(&["U1"], "GND"))
+            .with_port(port_ref(&["CF"], "2")),
+    );
     sch.assign_reference_designators();
     sch
 }

@@ -88,12 +88,13 @@ pub fn generate_schematic(sch: &Schematic, opts: &SchOptions) -> Result<Generate
         flag_nets[si].insert(net.name.clone());
     }
 
-    // Place and route every sheet.
+    // Place and route every sheet (routing also finalizes the text
+    // anchors recorded in the model).
     let mut models: Vec<SheetModel> = Vec::with_capacity(plan.sheets.len());
     let mut routed: Vec<RoutedSheet> = Vec::with_capacity(plan.sheets.len());
     for (si, sheet_flags) in flag_nets.iter().enumerate() {
-        let model = place_sheet(&design, &plan, si, cfg, &mut warnings);
-        let r = route_sheet(&design, &plan, &model, cfg, sheet_flags, &mut warnings);
+        let mut model = place_sheet(&design, &plan, si, cfg, &mut warnings);
+        let r = route_sheet(&design, &plan, &mut model, cfg, sheet_flags, &mut warnings);
         models.push(model);
         routed.push(r);
     }
@@ -184,10 +185,13 @@ fn emit_sheet(
             uuid_key: &comp.path_key,
             ref_at: Some(placed.ref_at),
             value_at: Some(placed.value_at),
+            // Reference: anchored bottom-left (text above the anchor);
+            // Value: anchored top (text below), left or right justified.
+            ref_justify: &["left", "bottom"],
             value_justify: if placed.value_justify_right {
-                &["right"]
+                &["right", "top"]
             } else {
-                &["left"]
+                &["left", "top"]
             },
             ..PlaceSymbol::new(&comp.geom.lib_id, &comp.refdes, &comp.value, placed.at)
         })?;
@@ -196,6 +200,9 @@ fn emit_sheet(
     // Wires and markers.
     for wire in &routed.wires {
         writer.add_wire(wire);
+    }
+    for at in &routed.junctions {
+        writer.add_junction(*at);
     }
     for (name, at, rotation) in &routed.net_labels {
         writer.add_net_label(name, *at, *rotation);
@@ -262,8 +269,9 @@ mod tests {
         let text = &a.files[0].content;
         assert!(text.contains("\"R1\""));
         assert!(text.contains("\"R2\""));
-        // Signal net labelled on both pins; rails become power symbols.
-        assert_eq!(text.matches("(label \"MID\"").count(), 2);
+        // MID is a facing 2-pin net: wired with a REAL wire, no labels.
+        assert_eq!(text.matches("(label \"MID\"").count(), 0);
+        assert!(text.contains("(wire"));
         assert!(text.contains("\"pcb_power:VCC\""));
         assert!(text.contains("\"pcb_power:GND\""));
         // Undriven rails get exactly one PWR_FLAG each.
@@ -326,7 +334,7 @@ mod tests {
         // Power symbols never become sheet pins.
         assert!(!root.contains("(pin \"VCC\""));
         // Sub-sheet symbols use the extended instance path.
-        assert!(child.contains(&format!("(path \"/")));
+        assert!(child.contains("(path \"/"));
 
         // Determinism across runs.
         let again = generate_schematic(&sch, &opts).unwrap();

@@ -4702,7 +4702,6 @@ name = "pcb-schematic"
 version = "0.4.4"
 dependencies = [
  "anyhow",
- "insta",
  "log",
  "natord",
  "pcb-sch",

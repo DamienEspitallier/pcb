@@ -1,27 +1,28 @@
-//! Sheet routing for the placed model — the label/power half of the
-//! validated `layout.ts` proof of concept.
+//! Sheet routing for the placed model — labels, hierarchical anchors,
+//! power doglegs and the real-wire passes of the validated `layout.ts`
+//! proof of concept.
 //!
-//! This phase wires:
-//! * signal pins: short stub + **horizontal** net label (vertical pins get
-//!   an elbow — labels are never rotated 90°), the wire underlining the
-//!   full text; design-wide single-endpoint nets get a global label;
-//! * hierarchical ports: the hierarchical label sits **directly at the end
-//!   of an internal anchor stub** (input -> leftmost left-pointing pin,
-//!   output -> rightmost right-pointing), other endpoints keep net labels;
-//!   nets exposed only by child blocks anchor on the first block pin; the
-//!   edge-column pattern remains as a warning-emitting fallback;
-//! * power/ground pins: short stub + generated power symbol on **every**
-//!   pin, symbols of the same net aligned in rows (common Y) when close,
-//!   dogleg retries avoiding foreign contacts; one PWR_FLAG per undriven
-//!   rail chained next to the first symbol of its assigned sheet;
-//! * every visible unconnected pin gets a no-connect marker;
-//! * child sheets appear as blocks in a 2-column grid below the content,
-//!   each sheet pin wired to a stub + homonym net label.
+//! Wiring order (each family avoids everything already placed):
+//! 1. instance Reference/Value texts ([`crate::texts`]) — their boxes are
+//!    keepouts for every wire placed next;
+//! 2. real-wire TREES of the signal groups (Zener `anchor=` info or the
+//!    non-hub heuristic — tree candidates are the most constrained);
+//! 3. stub + **horizontal** net labels for the remaining signal endpoints
+//!    (vertical pins get an elbow — labels are never rotated 90°), the
+//!    wire underlining the full text; design-wide single-endpoint nets
+//!    get a global label; hierarchical ports anchor **directly at the end
+//!    of an internal stub** chosen by flow;
+//! 4. facing pairs as direct/Z wires (top to bottom, staggered middle
+//!    branch, zero-crossing candidates preferred);
+//! 5. power/ground pins: short stub + generated power symbol on every
+//!    pin, same-net symbols aligned in rows (common Y), dogleg retries
+//!    avoiding foreign contacts; one PWR_FLAG per undriven rail chained
+//!    next to the first symbol of its assigned sheet;
+//! 6. no-connect markers, child sheet blocks, edge-column port fallback.
 //!
-//! An anti-contact registry (segments + pin positions) guarantees that no
-//! stub lands on a foreign wire or pin: only frank perpendicular crossings
-//! (which do not connect in KiCad) are tolerated, and candidates are scored
-//! to avoid even those.
+//! The anti-contact registry guarantees that no stub lands on a foreign
+//! wire or pin: only frank perpendicular crossings (which do not connect
+//! in KiCad) are tolerated, and candidates are scored to avoid even those.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,10 +34,12 @@ use crate::place::{
 };
 use crate::round4;
 use crate::sheets::SheetPlan;
-// (SheetPort is consumed through the plan's port lists.)
+use crate::texts::{Corridor, CorridorZone};
+use crate::wiring::{
+    EPS, Seg, dist, group_wire_subsets, is_hub_comp, is_pair_net_static, point_on_seg, quant,
+    seg_intersects_box, segs_cross_frank, segs_touch_forbidden,
+};
 use crate::writer::PortDirection;
-
-const EPS: f64 = 1e-3;
 
 type Point = (f64, f64);
 
@@ -44,6 +47,7 @@ type Point = (f64, f64);
 #[derive(Default)]
 pub struct RoutedSheet {
     pub wires: Vec<Vec<Point>>,
+    pub junctions: Vec<Point>,
     pub net_labels: Vec<(String, Point, i32)>,
     pub global_labels: Vec<(String, Point, i32, PortDirection)>,
     pub hier_labels: Vec<(String, PortDirection, Point, i32)>,
@@ -64,19 +68,26 @@ pub struct BlockModel {
     pub pins: Vec<(String, PortDirection, Point)>,
 }
 
-struct Seg {
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
-    net: String,
+/// Box of an already placed text, tagged with the net(s) it lets through.
+pub(crate) struct LabelBox {
+    pub bbox: BBox,
+    pub net: String,
+    /// Additional own nets of an instance text kept as a last resort on
+    /// the path of its own stubs (the wire may run under the text).
+    pub also: Vec<String>,
 }
 
-struct Reg {
-    segs: Vec<Seg>,
-    pins: Vec<(f64, f64, String)>,
-    power_boxes: Vec<(BBox, String)>,
-    label_boxes: Vec<(BBox, String)>,
+impl LabelBox {
+    pub(crate) fn allows(&self, net: &str) -> bool {
+        self.net == net || self.also.iter().any(|n| n == net)
+    }
+}
+
+pub(crate) struct Reg {
+    pub segs: Vec<Seg>,
+    pub pins: Vec<(f64, f64, String)>,
+    pub power_boxes: Vec<(BBox, String)>,
+    pub label_boxes: Vec<LabelBox>,
 }
 
 #[derive(Clone)]
@@ -139,16 +150,16 @@ pub(crate) fn power_symbol_graphic_box(net_name: &str, at: Point, down: bool) ->
 }
 
 impl Reg {
-    fn new() -> Reg {
+    fn new(label_boxes: Vec<LabelBox>) -> Reg {
         Reg {
             segs: Vec::new(),
             pins: Vec::new(),
             power_boxes: Vec::new(),
-            label_boxes: Vec::new(),
+            label_boxes,
         }
     }
 
-    fn register_path(&mut self, points: &[Point], net: &str) {
+    pub(crate) fn register_path(&mut self, points: &[Point], net: &str) {
         for w in points.windows(2) {
             if dist(w[0], w[1]) < EPS {
                 continue;
@@ -163,7 +174,7 @@ impl Reg {
         }
     }
 
-    fn count_crossings(&self, points: &[Point]) -> usize {
+    pub(crate) fn count_crossings(&self, points: &[Point]) -> usize {
         let mut n = 0;
         for w in points.windows(2) {
             if dist(w[0], w[1]) < EPS {
@@ -186,97 +197,7 @@ impl Reg {
     }
 }
 
-fn dist(a: Point, b: Point) -> f64 {
-    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
-}
-
-fn within(v: f64, lo: f64, hi: f64) -> bool {
-    v >= lo.min(hi) - EPS && v <= lo.max(hi) + EPS
-}
-
-fn point_on_seg(x: f64, y: f64, seg: &Seg) -> bool {
-    if (seg.y1 - seg.y2).abs() < EPS {
-        (y - seg.y1).abs() < EPS && within(x, seg.x1, seg.x2)
-    } else if (seg.x1 - seg.x2).abs() < EPS {
-        (x - seg.x1).abs() < EPS && within(y, seg.y1, seg.y2)
-    } else {
-        false
-    }
-}
-
-fn strictly_inside(v: f64, lo: f64, hi: f64) -> bool {
-    v > lo.min(hi) + EPS && v < lo.max(hi) - EPS
-}
-
-/// Forbidden contact between segments of different nets (axis aligned):
-/// touching or overlapping is forbidden, frank crossings are tolerated.
-fn segs_touch_forbidden(a: &Seg, b: &Seg) -> bool {
-    let a_h = (a.y1 - a.y2).abs() < EPS;
-    let b_h = (b.y1 - b.y2).abs() < EPS;
-    if a_h != b_h {
-        let ix = if a_h { b.x1 } else { a.x1 };
-        let iy = if a_h { a.y1 } else { b.y1 };
-        let in_a = point_on_seg(ix, iy, a);
-        let in_b = point_on_seg(ix, iy, b);
-        if !in_a || !in_b {
-            return false;
-        }
-        let interior_a = if a_h {
-            strictly_inside(ix, a.x1, a.x2)
-        } else {
-            strictly_inside(iy, a.y1, a.y2)
-        };
-        let interior_b = if b_h {
-            strictly_inside(ix, b.x1, b.x2)
-        } else {
-            strictly_inside(iy, b.y1, b.y2)
-        };
-        return !(interior_a && interior_b);
-    }
-    if a_h {
-        if (a.y1 - b.y1).abs() > EPS {
-            return false;
-        }
-        within(a.x1, b.x1, b.x2) || within(a.x2, b.x1, b.x2) || within(b.x1, a.x1, a.x2)
-    } else {
-        if (a.x1 - b.x1).abs() > EPS {
-            return false;
-        }
-        within(a.y1, b.y1, b.y2) || within(a.y2, b.y1, b.y2) || within(b.y1, a.y1, a.y2)
-    }
-}
-
-/// Frank (perpendicular, interior x interior) crossing between 2 segments.
-fn segs_cross_frank(a: &Seg, b: &Seg) -> bool {
-    let a_h = (a.y1 - a.y2).abs() < EPS;
-    let b_h = (b.y1 - b.y2).abs() < EPS;
-    if a_h == b_h {
-        return false;
-    }
-    let ix = if a_h { b.x1 } else { a.x1 };
-    let iy = if a_h { a.y1 } else { b.y1 };
-    let interior_a = if a_h {
-        strictly_inside(ix, a.x1, a.x2)
-    } else {
-        strictly_inside(iy, a.y1, a.y2)
-    };
-    let interior_b = if b_h {
-        strictly_inside(ix, b.x1, b.x2)
-    } else {
-        strictly_inside(iy, b.y1, b.y2)
-    };
-    interior_a && interior_b
-}
-
-fn seg_intersects_box(seg: &Seg, b: &BBox) -> bool {
-    let sx1 = seg.x1.min(seg.x2);
-    let sy1 = seg.y1.min(seg.y2);
-    let sx2 = seg.x1.max(seg.x2);
-    let sy2 = seg.y1.max(seg.y2);
-    sx1 < b.x2 - EPS && sx2 > b.x1 + EPS && sy1 < b.y2 - EPS && sy2 > b.y1 + EPS
-}
-
-fn label_text_box(name: &str, at: Point, rotation: i32) -> BBox {
+pub(crate) fn label_text_box(name: &str, at: Point, rotation: i32) -> BBox {
     let w = label_text_width(name);
     if rotation == 0 {
         BBox {
@@ -296,7 +217,7 @@ fn label_text_box(name: &str, at: Point, rotation: i32) -> BBox {
 }
 
 /// Body box of a hierarchical label (glyph + text) anchored at `at`.
-fn hier_text_box(name: &str, at: Point, rotation: i32) -> BBox {
+pub(crate) fn hier_text_box(name: &str, at: Point, rotation: i32) -> BBox {
     let w = label_text_width(name) + 1.27;
     if rotation == 0 {
         BBox {
@@ -317,43 +238,57 @@ fn hier_text_box(name: &str, at: Point, rotation: i32) -> BBox {
 
 /// One endpoint of a net on the sheet: position + outward direction.
 #[derive(Clone)]
-struct Endpoint {
-    placed: usize,
-    pos: Point,
-    dir: (f64, f64),
+pub(crate) struct Endpoint {
+    pub placed: usize,
+    pub pad: String,
+    pub pos: Point,
+    pub dir: (f64, f64),
 }
 
-pub struct Router<'a> {
-    cfg: &'a SchConfig,
-    design: &'a DesignModel,
-    model: &'a SheetModel,
-    plan: &'a SheetPlan,
-    reg: Reg,
-    out: RoutedSheet,
-    warnings: &'a mut Vec<String>,
+pub(crate) struct Router<'a> {
+    pub(crate) cfg: &'a SchConfig,
+    pub(crate) design: &'a DesignModel,
+    pub(crate) model: &'a SheetModel,
+    pub(crate) plan: &'a SheetPlan,
+    pub(crate) reg: Reg,
+    pub(crate) out: RoutedSheet,
+    pub(crate) warnings: &'a mut Vec<String>,
     /// Ports already anchored (hier label placed).
-    port_anchored: BTreeSet<String>,
+    pub(crate) port_anchored: BTreeSet<String>,
+    /// Predicted power keepouts (from the text pass).
+    pub(crate) corridors: Vec<Corridor>,
+    /// Endpoints (quantized positions) already wired by a tree, per sheet
+    /// net index: no labels for them.
+    pub(crate) group_wired: BTreeMap<usize, BTreeSet<(i64, i64)>>,
+    /// Per-net collapsed endpoints (stacked-pin buses emitted once).
+    collapsed: BTreeMap<usize, Vec<Endpoint>>,
 }
 
 /// Route one placed sheet. `flag_nets` = undriven rails whose PWR_FLAG this
-/// sheet carries.
+/// sheet carries. Also places the instance texts (the model records the
+/// final anchors).
 pub fn route_sheet(
     design: &DesignModel,
     plan: &SheetPlan,
-    model: &SheetModel,
+    model: &mut SheetModel,
     cfg: &SchConfig,
     flag_nets: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> RoutedSheet {
+    // Texts first: their boxes become keepouts for everything wired next.
+    let artifacts = crate::texts::place_instance_texts(cfg, design, model, warnings);
     let mut router = Router {
         cfg,
         design,
         model,
         plan,
-        reg: Reg::new(),
+        reg: Reg::new(artifacts.label_boxes),
         out: RoutedSheet::default(),
         warnings,
         port_anchored: BTreeSet::new(),
+        corridors: artifacts.corridors,
+        group_wired: BTreeMap::new(),
+        collapsed: BTreeMap::new(),
     };
     router.init_registry();
     router.route_signals();
@@ -410,11 +345,26 @@ impl<'a> Router<'a> {
             };
             out.push(Endpoint {
                 placed: *pi,
+                pad: pad.clone(),
                 pos,
                 dir,
             });
         }
         out
+    }
+
+    /// Cached, collapsed endpoints of a signal net (the stacked-pin bus
+    /// wires are emitted exactly once, on first use).
+    fn eps_for(&mut self, sn: usize) -> Vec<Endpoint> {
+        if let Some(cached) = self.collapsed.get(&sn) {
+            return cached.clone();
+        }
+        let net = &self.model.nets[sn];
+        let name = net.name.clone();
+        let eps = self.net_endpoints(net);
+        let eps = self.collapse_stacked_pins(eps, &name, true);
+        self.collapsed.insert(sn, eps.clone());
+        eps
     }
 
     /// Collapse stacks of adjacent same-net pins of one component (multi
@@ -484,7 +434,7 @@ impl<'a> Router<'a> {
         out
     }
 
-    fn path_ok(&self, points: &[Point], net: &str, exclude: Option<usize>) -> bool {
+    pub(crate) fn path_ok(&self, points: &[Point], net: &str, exclude: &[usize]) -> bool {
         for w in points.windows(2) {
             if dist(w[0], w[1]) < EPS {
                 continue;
@@ -511,8 +461,8 @@ impl<'a> Router<'a> {
                     return false;
                 }
             }
-            for (lb, lnet) in &self.reg.label_boxes {
-                if lnet != net && seg_intersects_box(&seg, lb) {
+            for lb in &self.reg.label_boxes {
+                if !lb.allows(net) && seg_intersects_box(&seg, &lb.bbox) {
                     return false;
                 }
             }
@@ -524,7 +474,7 @@ impl<'a> Router<'a> {
                 y2: seg.y1.max(seg.y2) - EPS,
             };
             for (pi, p) in self.model.placed.iter().enumerate() {
-                if Some(pi) == exclude {
+                if exclude.contains(&pi) {
                     continue;
                 }
                 let rb = raw_box(&self.design.comps[p.comp].geom, p.at, p.rotation, p.mirror);
@@ -537,9 +487,10 @@ impl<'a> Router<'a> {
     }
 
     /// May a label text live here without covering anything foreign?
-    fn label_box_clear(&self, bbox: &BBox, net: &str, strict: bool) -> bool {
-        for (pi, p) in self.model.placed.iter().enumerate() {
-            let _ = pi;
+    /// `strict` also rejects overlap with same-net texts (two homonym
+    /// stacked labels read as one and hide the second wire).
+    pub(crate) fn label_box_clear(&self, bbox: &BBox, net: &str, strict: bool) -> bool {
+        for p in self.model.placed.iter() {
             let rb = raw_box(&self.design.comps[p.comp].geom, p.at, p.rotation, p.mirror);
             if overlaps(&rb, bbox) {
                 return false;
@@ -567,8 +518,17 @@ impl<'a> Router<'a> {
                 return false;
             }
         }
-        for (lb, lnet) in &self.reg.label_boxes {
-            if (strict || lnet != net) && overlaps(lb, bbox) {
+        for lb in &self.reg.label_boxes {
+            if (strict || !lb.allows(net)) && overlaps(&lb.bbox, bbox) {
+                return false;
+            }
+        }
+        // Predicted power corridors: a label on the pin-to-symbol path of a
+        // rail would doom every dogleg candidate. Same net tolerated; the
+        // `Graphic` zones only apply to instance texts (the symbol knows
+        // how to stretch away from a label).
+        for c in &self.corridors {
+            if c.zone == CorridorZone::Corridor && c.net != net && overlaps(&c.bbox, bbox) {
                 return false;
             }
         }
@@ -580,33 +540,92 @@ impl<'a> Router<'a> {
     // --------------------------------------------------------------
 
     fn route_signals(&mut self) {
-        // Port nets last: their hier-label stubs know how to stretch.
+        // Port nets last: their hier-label stubs know how to stretch,
+        // plain nets' elbows only have a dozen candidates near the body.
         let mut order: Vec<usize> = (0..self.model.nets.len())
             .filter(|&sn| self.model.nets[sn].class == NetClass::Signal)
             .collect();
         order.sort_by_key(|&sn| (self.model.nets[sn].port.is_some(), sn));
 
+        // Facing pairs are wired LAST (top to bottom): a direct wire has
+        // one channel while labels and doglegs have dozens of candidates.
+        let mut pair_nets: Vec<usize> = Vec::new();
+        let mut label_nets: Vec<usize> = Vec::new();
         for sn in order {
-            let net = &self.model.nets[sn];
-            let name = net.name.clone();
-            let port = net.port;
-            let single = net.design_endpoints <= 1;
-            let eps = self.net_endpoints(net);
-            if eps.is_empty() {
+            if is_pair_net_static(
+                self.cfg,
+                self.design,
+                &self.model.placed,
+                &self.model.nets,
+                sn,
+            ) {
+                pair_nets.push(sn);
                 continue;
             }
-            let mut eps = self.collapse_stacked_pins(eps, &name, true);
-            let is_root = self.plan.sheets[self.model.sheet].parent.is_none();
-            if let Some(direction) = port
-                && !is_root
-                && !self.port_anchored.contains(&name)
-                && let Some(anchored) = self.anchor_port(&name, direction, &eps)
-            {
-                eps.retain(|e| quant(e.pos) != quant(anchored.pos));
-            }
-            for ep in eps {
-                self.emit_label_stub(&name, &ep, single);
-            }
+            self.plan_and_wire_group(sn);
+            label_nets.push(sn);
+        }
+        for sn in label_nets {
+            self.wire_signal_net(sn);
+        }
+        let mut top_y: BTreeMap<usize, i64> = BTreeMap::new();
+        for &sn in &pair_nets {
+            let eps = self.eps_for(sn);
+            let min = eps
+                .iter()
+                .map(|e| (e.pos.1 * 10000.0).round() as i64)
+                .min()
+                .unwrap_or(i64::MAX);
+            top_y.insert(sn, min);
+        }
+        pair_nets.sort_by_key(|&sn| (top_y[&sn], self.model.nets[sn].name.clone()));
+        for sn in pair_nets {
+            self.wire_signal_net(sn);
+        }
+    }
+
+    /// Label pass of one signal net: direct wire for facing pairs, then
+    /// stub + label for every endpoint not already wired by a tree; the
+    /// hierarchical label of a port net anchors the stub of a preferred
+    /// endpoint, the others keep homonym net labels.
+    fn wire_signal_net(&mut self, sn: usize) {
+        let eps = self.eps_for(sn);
+        if eps.is_empty() {
+            return;
+        }
+        if is_pair_net_static(
+            self.cfg,
+            self.design,
+            &self.model.placed,
+            &self.model.nets,
+            sn,
+        ) && self.try_direct_wire(sn, &eps)
+        {
+            return;
+        }
+        let name = self.model.nets[sn].name.clone();
+        let single = self.model.nets[sn].design_endpoints <= 1;
+        let port = self.model.nets[sn].port;
+        let is_root = self.plan.sheets[self.model.sheet].parent.is_none();
+        let mut rest: Vec<Endpoint> = match self.group_wired.get(&sn) {
+            Some(wired) => eps
+                .into_iter()
+                .filter(|e| !wired.contains(&quant(e.pos)))
+                .collect(),
+            None => eps,
+        };
+        if rest.is_empty() {
+            return;
+        }
+        if let Some(direction) = port
+            && !is_root
+            && !self.port_anchored.contains(&name)
+            && let Some(anchored) = self.anchor_port(&name, direction, &rest)
+        {
+            rest.retain(|e| quant(e.pos) != quant(anchored.pos));
+        }
+        for ep in rest {
+            self.emit_label_stub(&name, &ep, single);
         }
     }
 
@@ -630,12 +649,15 @@ impl<'a> Router<'a> {
                     }
                 }
             }
+            // 4-level selection: STRICTLY free box (no text overlap, same
+            // net included) > free in the labelBoxClear sense > first
+            // placeable zero-crossing path > first placeable path.
             let mut fallback_any: Option<usize> = None;
             let mut fallback: Option<usize> = None;
             let mut relaxed: Option<usize> = None;
             let mut strict: Option<usize> = None;
             for (i, (path, at, rotation)) in candidates.iter().enumerate() {
-                if !self.path_ok(path, name, Some(ep.placed)) {
+                if !self.path_ok(path, name, &[ep.placed]) {
                     continue;
                 }
                 fallback_any.get_or_insert(i);
@@ -671,7 +693,7 @@ impl<'a> Router<'a> {
         for extra in [0.0, 2.54, 5.08, 7.62, 10.16, 12.7] {
             let end = (round4(ep.pos.0 + ep.dir.0 * (base + extra)), ep.pos.1);
             let path = vec![ep.pos, end];
-            if !self.path_ok(&path, name, Some(ep.placed)) {
+            if !self.path_ok(&path, name, &[ep.placed]) {
                 continue;
             }
             if self.reg.count_crossings(&path) != 0 {
@@ -708,9 +730,11 @@ impl<'a> Router<'a> {
         if path.len() >= 2 && dist(path[0], *path.last().unwrap()) > EPS {
             self.out.wires.push(path);
         }
-        self.reg
-            .label_boxes
-            .push((label_text_box(name, at, rotation), name.to_string()));
+        self.reg.label_boxes.push(LabelBox {
+            bbox: label_text_box(name, at, rotation),
+            net: name.to_string(),
+            also: Vec::new(),
+        });
         if global {
             self.out.global_labels.push((
                 name.to_string(),
@@ -746,7 +770,7 @@ impl<'a> Router<'a> {
         for &ei in &order {
             let ep = &eps[ei];
             for (path, at, rotation) in self.hier_stub_candidates(name, ep) {
-                if !self.path_ok(&path, name, Some(ep.placed)) {
+                if !self.path_ok(&path, name, &[ep.placed]) {
                     continue;
                 }
                 if fallback_any.is_none() {
@@ -797,15 +821,21 @@ impl<'a> Router<'a> {
         self.out
             .hier_labels
             .push((name.to_string(), direction, at, rotation));
-        self.reg
-            .label_boxes
-            .push((hier_text_box(name, at, rotation), name.to_string()));
+        self.reg.label_boxes.push(LabelBox {
+            bbox: hier_text_box(name, at, rotation),
+            net: name.to_string(),
+            also: Vec::new(),
+        });
         self.port_anchored.insert(name.to_string());
         eps[ei].clone()
     }
 
     /// Candidate stubs carrying a hierarchical label, shortest first.
-    fn hier_stub_candidates(&self, name: &str, ep: &Endpoint) -> Vec<(Vec<Point>, Point, i32)> {
+    pub(crate) fn hier_stub_candidates(
+        &self,
+        name: &str,
+        ep: &Endpoint,
+    ) -> Vec<(Vec<Point>, Point, i32)> {
         let cfg = self.cfg;
         let mut out = Vec::new();
         if ep.dir.1.abs() > 0.5 {
@@ -834,7 +864,11 @@ impl<'a> Router<'a> {
     /// Preference order of the endpoints for a port anchor: flow-matching
     /// side first (input -> leftmost left-pointing stub, output -> rightmost
     /// right-pointing), then against-flow horizontals, then vertical pins.
-    fn port_anchor_order(&self, direction: PortDirection, eps: &[Endpoint]) -> Vec<usize> {
+    pub(crate) fn port_anchor_order(
+        &self,
+        direction: PortDirection,
+        eps: &[Endpoint],
+    ) -> Vec<usize> {
         let mut horiz: Vec<usize> = (0..eps.len())
             .filter(|&i| eps[i].dir.1.abs() < 0.5)
             .collect();
@@ -953,7 +987,7 @@ impl<'a> Router<'a> {
                 let mut best_crossings = usize::MAX;
                 for cand in &cands {
                     let gbox = power_symbol_graphic_box(&name, cand.symbol_at, cand.down);
-                    if self.path_ok(&cand.path, &name, Some(ep.placed))
+                    if self.path_ok(&cand.path, &name, &[ep.placed])
                         && self.graphic_box_clear(&gbox, &name)
                     {
                         let crossings = self.reg.count_crossings(&cand.path);
@@ -1157,8 +1191,8 @@ impl<'a> Router<'a> {
                 return false;
             }
         }
-        for (lb, lnet) in &self.reg.label_boxes {
-            if lnet != net && overlaps(lb, bbox) {
+        for lb in &self.reg.label_boxes {
+            if !lb.allows(net) && overlaps(&lb.bbox, bbox) {
                 return false;
             }
         }
@@ -1186,7 +1220,7 @@ impl<'a> Router<'a> {
         let chosen = candidates
             .iter()
             .find(|&&at| {
-                self.path_ok(&[symbol_at, at], net, None)
+                self.path_ok(&[symbol_at, at], net, &[])
                     && self.graphic_box_clear(&flag_box(at), net)
             })
             .copied()
@@ -1297,15 +1331,19 @@ impl<'a> Router<'a> {
                         self.out
                             .hier_labels
                             .push((name.clone(), direction, end, 180));
-                        self.reg
-                            .label_boxes
-                            .push((hier_text_box(&name, end, 180), name.clone()));
+                        self.reg.label_boxes.push(LabelBox {
+                            bbox: hier_text_box(&name, end, 180),
+                            net: name.clone(),
+                            also: Vec::new(),
+                        });
                         self.port_anchored.insert(name);
                     } else {
                         self.out.net_labels.push((name.clone(), end, 0));
-                        self.reg
-                            .label_boxes
-                            .push((label_text_box(&name, end, 0), name));
+                        self.reg.label_boxes.push(LabelBox {
+                            bbox: label_text_box(&name, end, 0),
+                            net: name,
+                            also: Vec::new(),
+                        });
                     }
                 }
                 for (k, port) in right.iter().enumerate() {
@@ -1317,15 +1355,19 @@ impl<'a> Router<'a> {
                     self.reg.register_path(&[at, end], &name);
                     if let Some(direction) = block_anchor.remove(&name) {
                         self.out.hier_labels.push((name.clone(), direction, end, 0));
-                        self.reg
-                            .label_boxes
-                            .push((hier_text_box(&name, end, 0), name.clone()));
+                        self.reg.label_boxes.push(LabelBox {
+                            bbox: hier_text_box(&name, end, 0),
+                            net: name.clone(),
+                            also: Vec::new(),
+                        });
                         self.port_anchored.insert(name);
                     } else {
                         self.out.net_labels.push((name.clone(), end, 180));
-                        self.reg
-                            .label_boxes
-                            .push((label_text_box(&name, end, 180), name));
+                        self.reg.label_boxes.push(LabelBox {
+                            bbox: label_text_box(&name, end, 180),
+                            net: name,
+                            also: Vec::new(),
+                        });
                     }
                 }
                 self.out.blocks.push(BlockModel {
@@ -1441,13 +1483,26 @@ impl<'a> Router<'a> {
         }
         self.out.extents = extents;
     }
-}
 
-fn quant(p: Point) -> (i64, i64) {
-    (
-        (p.0 * 10000.0).round() as i64,
-        (p.1 * 10000.0).round() as i64,
-    )
+    /// Used by `plan_and_wire_group` (defined in [`crate::wiring`]) — kept
+    /// here so both modules share one collapsed-endpoint cache.
+    pub(crate) fn eps_for_net(&mut self, sn: usize) -> Vec<Endpoint> {
+        self.eps_for(sn)
+    }
+
+    /// Group prediction for one net (shared with the orientation engine).
+    pub(crate) fn group_subsets(&self, eps: &[Endpoint]) -> Vec<Vec<usize>> {
+        let eps_placed: Vec<usize> = eps.iter().map(|e| e.placed).collect();
+        let cfg = self.cfg;
+        let design = self.design;
+        let placed = &self.model.placed;
+        group_wire_subsets(
+            &eps_placed,
+            &|pi| is_hub_comp(cfg, design, placed[pi].comp),
+            &|pi| placed[pi].group_root,
+            &|pi| design.comps[placed[pi].comp].refdes.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1494,5 +1549,22 @@ mod tests {
         let b = power_attachment(&cfg, (10.0, 10.0), (1.0, 0.0), false, 0.0, 0.0);
         assert_eq!(b.path.len(), 3);
         assert_eq!(b.symbol_at, (12.54, 7.46));
+    }
+
+    #[test]
+    fn label_box_allows_extra_nets() {
+        let lb = LabelBox {
+            bbox: BBox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+            },
+            net: "A".to_string(),
+            also: vec!["B".to_string()],
+        };
+        assert!(lb.allows("A"));
+        assert!(lb.allows("B"));
+        assert!(!lb.allows("C"));
     }
 }

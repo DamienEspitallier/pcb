@@ -118,6 +118,9 @@ pub struct SymbolGeom {
     pub body_bbox: BBox,
     /// Bounding box including pin connection points.
     pub full_bbox: BBox,
+    /// `(pin_numbers hide)` at the symbol level: eeschema renders no pin
+    /// numbers, so text placement needs no number halo along the pins.
+    pub pin_numbers_hidden: bool,
 }
 
 impl SymbolGeom {
@@ -224,12 +227,26 @@ pub fn parse_lib_symbol(raw: &str, rename_to: Option<&str>) -> Result<SymbolGeom
         full_bbox.include(pin.x, pin.y);
     }
 
+    // `(pin_numbers hide)` (KiCad <= 7) or `(pin_numbers (hide yes))` (8+).
+    let pin_numbers_hidden = root
+        .as_list()
+        .and_then(|items| pcb_sexpr::find_child_list(items, "pin_numbers"))
+        .map(|pn| {
+            pn.iter().any(|it| it.as_sym() == Some("hide"))
+                || pcb_sexpr::find_child_list(pn, "hide")
+                    .and_then(|h| h.get(1))
+                    .and_then(Sexpr::as_sym)
+                    == Some("yes")
+        })
+        .unwrap_or(false);
+
     Ok(SymbolGeom {
         lib_id,
         sexpr: root,
         pins,
         body_bbox,
         full_bbox,
+        pin_numbers_hidden,
     })
 }
 

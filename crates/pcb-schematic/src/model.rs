@@ -142,6 +142,10 @@ pub struct Comp {
     /// Explicit anchor attribute (sibling instance name), if any.
     pub anchor_attr: Option<String>,
     pub side_attr: Option<Side>,
+    /// Board-edge constraint (`edge` attribute). An edge-constrained
+    /// connector keeps its orientation (pins toward the sheet interior):
+    /// the orientation engine never mirrors it.
+    pub edge_attr: Option<String>,
     /// Manual position (hard constraint) from `# pcb:sch` comments.
     pub manual: Option<ManualPosition>,
     /// Number of visible (non-hidden, deduplicated by position) pins.
@@ -246,6 +250,7 @@ impl DesignModel {
                 side_attr: inst
                     .string_attr(&["side"])
                     .and_then(|s| Side::from_attr(&s)),
+                edge_attr: inst.string_attr(&["edge"]),
                 manual: None, // filled below
                 visible_pins: 0,
             });

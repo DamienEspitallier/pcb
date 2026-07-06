@@ -39,6 +39,10 @@ pub struct PlacedComp {
     pub pinned: bool,
     /// Resolved anchor (index into the sheet's `placed` vector).
     pub anchor: Option<usize>,
+    /// Root of the anchor chain (the component itself for majors). Two
+    /// endpoints with the same root belong to one placement group and wire
+    /// together with real wires ("everything goes together" rule).
+    pub group_root: usize,
     pub side: Side,
     pub role: Role,
     /// Solid box (sheet coordinates), kept in sync with `at`.
@@ -111,8 +115,8 @@ fn categorize(role: Role) -> Category {
 }
 
 /// Roles allowed to rotate (drawn two-pin parts). Boxes (ICs, connectors)
-/// only mirror — and mirroring is decided by the phase-3 orientation engine.
-fn is_rotatable(role: Role) -> bool {
+/// only mirror — and mirroring is decided by the orientation engine.
+pub(crate) fn is_rotatable(role: Role) -> bool {
     matches!(
         role,
         Role::Passive | Role::Decoupling | Role::Bulk | Role::Pull | Role::Led | Role::Crystal
@@ -218,6 +222,39 @@ pub(crate) fn label_text_width(name: &str) -> f64 {
     (name.chars().count() as f64 + 1.0) * 1.27
 }
 
+/// Solid box of a component for an explicit transform: raw box (body +
+/// pins) plus the Reference above the top-left corner and the Value below
+/// (text widths included). Shared by the placement engine and the
+/// orientation engine (which probes candidate transforms).
+pub(crate) fn solid_box_for(
+    cfg: &SchConfig,
+    design: &DesignModel,
+    p: &PlacedComp,
+    rotation: i32,
+    mirror: Option<MirrorAxis>,
+) -> BBox {
+    let geom = &design.comps[p.comp].geom;
+    let raw = raw_box(geom, p.at, rotation, mirror);
+    let comp = &design.comps[p.comp];
+    let ref_w = label_text_width(&comp.refdes);
+    let val_w = label_text_width(&comp.value);
+    let mut b = raw;
+    b.y1 -= cfg.ref_gap_grid_steps as f64 * cfg.grid_mm + 2.54;
+    b.x2 = b.x2.max(raw.x1 + ref_w);
+    b.y2 += cfg.value_gap_grid_steps as f64 * cfg.grid_mm + 2.54;
+    let has_bottom = geom.pins.iter().filter(|pin| !pin.hidden).any(|pin| {
+        geom.pin_outward(&pin.number, rotation, mirror)
+            .map(|d| d.1 > 0.5)
+            .unwrap_or(false)
+    });
+    if has_bottom {
+        b.x1 = b.x1.min(raw.x2 - val_w);
+    } else {
+        b.x2 = b.x2.max(raw.x1 + val_w);
+    }
+    b
+}
+
 /// Length of the horizontal wire carrying a net label: the wire must
 /// underline the full text and respect the configured minimum.
 pub(crate) fn label_stub_len(cfg: &SchConfig, name: &str) -> f64 {
@@ -267,6 +304,7 @@ pub fn place_sheet(
                 mirror,
                 pinned,
                 anchor: None,
+                group_root: 0, // resolved in `run`
                 side: Side::default_for(comp.role),
                 role: comp.role,
                 bbox: BBox::EMPTY,
@@ -510,6 +548,9 @@ impl<'a> Engine<'a> {
     fn run(&mut self, sheet: &SheetDef) {
         // Resolve anchor chains to a root; unresolved chains become majors.
         let roots = self.resolve_groups();
+        for (pi, &root) in roots.iter().enumerate() {
+            self.placed[pi].group_root = root;
+        }
 
         // Solid boxes for pinned comps (fixed).
         for pi in 0..self.placed.len() {
@@ -558,6 +599,16 @@ impl<'a> Engine<'a> {
         // Global safety net: collision resolution over everything.
         let order: Vec<usize> = (0..self.placed.len()).collect();
         self.resolve_collisions(&order);
+
+        // Final, group-aware orientation (positions frozen — only
+        // rotation/mirror change, before texts and wiring).
+        crate::orientation::orient_for_wiring(
+            self.cfg,
+            self.design,
+            &mut self.placed,
+            &self.nets,
+            &self.pin_net,
+        );
 
         // Uniform translation into the page (margins), preserving the
         // relative geometry of pinned components.
@@ -1027,21 +1078,8 @@ impl<'a> Engine<'a> {
     /// Solid box: raw box + Reference above the top-left corner + Value
     /// below (text widths included).
     fn solid_box(&self, pi: usize) -> BBox {
-        let cfg = self.cfg;
-        let raw = self.raw_box_of(pi);
-        let comp = &self.design.comps[self.placed[pi].comp];
-        let ref_w = label_text_width(&comp.refdes);
-        let val_w = label_text_width(&comp.value);
-        let mut b = raw;
-        b.y1 -= cfg.ref_gap_grid_steps as f64 * cfg.grid_mm + 2.54;
-        b.x2 = b.x2.max(raw.x1 + ref_w);
-        b.y2 += cfg.value_gap_grid_steps as f64 * cfg.grid_mm + 2.54;
-        if self.has_bottom_pins(pi) {
-            b.x1 = b.x1.min(raw.x2 - val_w);
-        } else {
-            b.x2 = b.x2.max(raw.x1 + val_w);
-        }
-        b
+        let p = &self.placed[pi];
+        solid_box_for(self.cfg, self.design, p, p.rotation, p.mirror)
     }
 
     fn has_bottom_pins(&self, pi: usize) -> bool {
@@ -1121,6 +1159,17 @@ impl<'a> Engine<'a> {
                 continue;
             };
             if self.nets[sn].class != NetClass::Signal {
+                continue;
+            }
+            // Paired nets get a direct/Z wire, not a stub + label: no
+            // label keepout (the wire candidates stagger by themselves).
+            if crate::wiring::is_pair_net_static(
+                self.cfg,
+                self.design,
+                &self.placed,
+                &self.nets,
+                sn,
+            ) {
                 continue;
             }
             let Some(pos) = geom.pin_position(&pin.number, p.at, p.rotation, p.mirror) else {

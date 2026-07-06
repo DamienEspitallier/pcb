@@ -9,8 +9,11 @@
 //!
 //! Entry point: [`generate_schematic`] plans the sheet hierarchy
 //! ([`sheets`]), places every sheet by signal flow with satellites stuck to
-//! their anchors ([`place`]), routes label stubs and power symbols
-//! ([`route`]) and emits the documents through [`writer`]. Manual
+//! their anchors ([`place`]), orients components toward their wiring
+//! targets ([`orientation`]), lays out Reference/Value texts with real
+//! collision checks ([`texts`]), wires signal groups with real wires and
+//! junctions where the rules allow, labels the rest ([`wiring`],
+//! [`route`]) and emits the documents through [`writer`]. Manual
 //! `# pcb:sch` positions are honored as hard constraints.
 
 pub mod config;
@@ -20,11 +23,14 @@ pub mod writer;
 
 mod generate;
 mod model;
+mod orientation;
 mod place;
 mod route;
 mod sheets;
 #[cfg(test)]
 mod testkit;
+mod texts;
+mod wiring;
 
 pub use config::{Paper, SchConfig};
 pub use generate::{GeneratedSchematic, SchFile, SchOptions, generate_schematic};

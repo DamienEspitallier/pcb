@@ -478,11 +478,17 @@ impl<'a> Engine<'a> {
             // side (filter/pull pattern); a series part on signal-only nets
             // stays in the flow UNLESS it is the terminal element of an
             // input/output chain feeding an IC (connector/external label ->
-            // passives -> IC pin) — then it rides next to that IC's pin.
+            // passives -> IC pin) — then it rides next to that IC's pin. A net
+            // tie is ALWAYS an inline series element (a Kelvin sense tap bridges
+            // a bus net to an amp input), so it takes the same seat-at-the-pin
+            // path even though one of its nets is a power/bus rail.
             let my_nets: Vec<usize> = self.placed_net_indices(pi);
             let classes: Vec<NetClass> = my_nets.iter().map(|&sn| self.nets[sn].class).collect();
+            let is_net_tie = self.design.comps[self.placed[pi].comp].is_net_tie;
             if role == Role::Passive
-                && !(classes.contains(&NetClass::Ground) || classes.contains(&NetClass::Power))
+                && (is_net_tie
+                    || !(classes.contains(&NetClass::Ground)
+                        || classes.contains(&NetClass::Power)))
             {
                 if let Some((ti, side)) = self.input_chain_anchor(pi, &my_nets, &majors) {
                     self.placed[pi].anchor = Some(ti);
@@ -1014,6 +1020,76 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Re-seat each net tie inline on the IC input pin it feeds: laid flat along
+    /// the pin's horizontal axis, its signal pad landing on the pin's exit stub
+    /// and its bus pad reaching outward (away from the IC) to the bus power
+    /// symbol. Two ties on adjacent inputs (a Kelvin sense pair) then sit at
+    /// their exact pin rows instead of being spread around the IC's centre by
+    /// the generic satellite placement. Purely a move/rotate — netlist untouched.
+    fn reseat_net_ties(&mut self) {
+        let cfg = self.cfg;
+        for pi in 0..self.placed.len() {
+            if self.placed[pi].pinned || !self.design.comps[self.placed[pi].comp].is_net_tie {
+                continue;
+            }
+            let Some(ic) = self.placed[pi].anchor else {
+                continue;
+            };
+            if !self.is_ic_major(ic) {
+                continue;
+            }
+            // The tie's signal net (the pad that lands on the IC) and the IC pin
+            // it feeds. The other pad is the bus/Kelvin side.
+            let my_nets = self.placed_net_indices(pi);
+            let Some(&sig) = my_nets.iter().find(|&&sn| {
+                self.nets[sn].class == NetClass::Signal
+                    && self.nets[sn].endpoints.iter().any(|(opi, _)| *opi == ic)
+            }) else {
+                continue;
+            };
+            let Some((pin_pos, dir)) = self.ic_pin_pos_dir(ic, sig) else {
+                continue;
+            };
+            // Only horizontal-exit inputs: the flat tie lies along the stub.
+            if dir.0.abs() < 0.5 {
+                continue;
+            }
+            // Which tie pad carries the signal (faces the IC) vs the bus.
+            let geom = &self.design.comps[self.placed[pi].comp].geom;
+            let Some(sig_pad) = geom
+                .pins
+                .iter()
+                .filter(|p| !p.hidden)
+                .map(|p| p.number.clone())
+                .find(|num| self.pin_net.get(&(pi, num.clone())) == Some(&sig))
+            else {
+                continue;
+            };
+            // Lay the tie flat (0/180). Pick the rotation that puts the signal
+            // pad on the IC side of the tie body (its local X toward the IC,
+            // i.e. opposite the pin's outward direction). Seating the signal pad
+            // right on the pin's exit stub keeps the sense net one continuous
+            // wire — stepping the tie further out would force a labelled break.
+            let rot = match geom.pin_position(&sig_pad, (0.0, 0.0), 0, None) {
+                Some((lx, _)) if (lx * dir.0) < 0.0 => 0,
+                Some(_) => 180,
+                None => continue,
+            };
+            let target = (
+                round4(pin_pos.0 + dir.0 * cfg.min_pin_exit_mm()),
+                round4(pin_pos.1),
+            );
+            let geom = &self.design.comps[self.placed[pi].comp].geom;
+            let Some(rl) = geom.pin_position(&sig_pad, (0.0, 0.0), rot, None) else {
+                continue;
+            };
+            self.placed[pi].rotation = rot;
+            self.placed[pi].mirror = None;
+            self.placed[pi].at = (cfg.snap(target.0 - rl.0), cfg.snap(target.1 - rl.1));
+            self.placed[pi].bbox = self.solid_box(pi);
+        }
+    }
+
     /// Does the sheet carry a real IC (a part with at least
     /// `input_chain_min_pins` visible pins)? Only such sheets get their
     /// decoupling relegated and their zones outlined — a passive-only sheet
@@ -1175,6 +1251,12 @@ impl<'a> Engine<'a> {
         // that pin's exit stub as one continuous wire (runs after orientation
         // so the pull is upright and the IC pins are in their final places).
         self.reseat_pullups();
+
+        // Seat each net tie inline on the IC input pin it feeds: horizontal,
+        // signal pad on the pin's exit stub, bus pad reaching outward to its
+        // power symbol. Runs after the IC pins are final so ties on adjacent
+        // inputs stack exactly at their pin rows (Kelvin sense taps).
+        self.reseat_net_ties();
 
         // Relegate the rail-to-rail capacitors (decoupling/bulk) into a tidy
         // row in the right-hand utility band, out of the functional flow.

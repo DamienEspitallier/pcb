@@ -86,9 +86,19 @@ pub(crate) struct LabelBox {
     pub also: Vec<String>,
 }
 
+/// A text box whose `net` carries this prefix is SOFT: any wire may pass under
+/// it. Used for a net tie's tiny "NTx" designator — the tie is an inline layout
+/// bridge sitting on the very wire it must not obstruct, and two ties stacked at
+/// the input pitch each overhang the neighbour's sense wire. The box still
+/// blocks OTHER texts (text-vs-text layout compares raw boxes, not `allows`), so
+/// designators stay legible; only routing ignores it.
+pub(crate) const SOFT_TEXT_PREFIX: &str = "~soft~";
+
 impl LabelBox {
     pub(crate) fn allows(&self, net: &str) -> bool {
-        self.net == net || self.also.iter().any(|n| n == net)
+        self.net.starts_with(SOFT_TEXT_PREFIX)
+            || self.net == net
+            || self.also.iter().any(|n| n == net)
     }
 }
 

@@ -736,10 +736,17 @@ pub(crate) fn place_instance_texts(
         };
         let mut ref_nets = tags_for(&ref_bbox);
         let mut val_nets = tags_for(&val_bbox);
+        // A net tie's designator never obstructs routing (see SOFT_TEXT_PREFIX):
+        // it is an inline bridge sitting on the wire it must not wall off.
+        let untagged = if comp.is_net_tie {
+            format!("{}{refdes}", crate::route::SOFT_TEXT_PREFIX)
+        } else {
+            format!("~text~{refdes}")
+        };
         label_boxes.push(LabelBox {
             bbox: ref_bbox,
             net: if ref_nets.is_empty() {
-                format!("~text~{refdes}")
+                untagged.clone()
             } else {
                 ref_nets.remove(0)
             },
@@ -748,7 +755,7 @@ pub(crate) fn place_instance_texts(
         label_boxes.push(LabelBox {
             bbox: val_bbox,
             net: if val_nets.is_empty() {
-                format!("~text~{refdes}")
+                untagged
             } else {
                 val_nets.remove(0)
             },

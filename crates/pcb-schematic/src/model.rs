@@ -165,6 +165,11 @@ pub struct Comp {
     /// generic box rather than a curated library symbol. Net classification
     /// treats such endpoints as digital IC boxes.
     pub synthesized: bool,
+    /// A net tie / 0R jumper: a layout-only two-pin part that splits one
+    /// electrical node into two nets (e.g. a Kelvin sense tap). It is always
+    /// an inline series element, so placement seats it at the pin it feeds
+    /// rather than relegating it to a flank like a filter passive.
+    pub is_net_tie: bool,
 }
 
 /// One net of the design.
@@ -242,6 +247,14 @@ impl DesignModel {
                 }
             };
 
+            // A net tie is a layout-only two-pin bridge. The generic sets no
+            // `Type`, so fall back to the KiCad net-tie symbol family (lib_id
+            // `…NetTie…`, e.g. `Device:NetTie_2`).
+            let is_net_tie = inst
+                .component_type()
+                .is_some_and(|t| t.eq_ignore_ascii_case("net_tie"))
+                || geom.lib_id.to_ascii_lowercase().contains("nettie");
+
             let visible_pins = {
                 let mut seen: BTreeSet<(i64, i64)> = BTreeSet::new();
                 for pin in geom.pins.iter().filter(|p| !p.hidden) {
@@ -277,6 +290,7 @@ impl DesignModel {
                 manual: None, // filled below
                 visible_pins: 0,
                 synthesized,
+                is_net_tie,
             });
             comps.last_mut().unwrap().visible_pins = visible_pins;
         }

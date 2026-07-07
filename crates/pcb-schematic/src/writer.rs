@@ -563,7 +563,7 @@ impl SheetWriter {
     /// net not driven by a real `power_out` pin, otherwise `kicad-cli sch
     /// erc` reports `power_pin_not_driven` (error). Never place two on the
     /// same net. Returns the allocated `#FLGnn` reference.
-    pub fn add_pwr_flag(&mut self, at: (f64, f64)) -> String {
+    pub fn add_pwr_flag(&mut self, at: (f64, f64), rot: i32) -> String {
         let lib_id = format!("{POWER_LIB_NICKNAME}:PWR_FLAG");
         if !self.libs.contains_key(&lib_id) {
             let entry = build_pwr_flag_lib_symbol(&lib_id);
@@ -578,7 +578,7 @@ impl SheetWriter {
         let mut items = vec![
             sym("symbol"),
             node("lib_id", vec![sstr(&lib_id)]),
-            node("at", vec![num(x), num(y), int(0)]),
+            node("at", vec![num(x), num(y), int(rot as i64)]),
             node("unit", vec![int(1)]),
             node("exclude_from_sim", vec![sym("no")]),
             node("in_bom", vec![sym("yes")]),
@@ -1139,7 +1139,7 @@ mod tests {
             (127.0, 63.5),
         ))
         .unwrap();
-        w.add_pwr_flag((127.0, 58.42));
+        w.add_pwr_flag((127.0, 58.42), 0);
         let text = w.serialize();
 
         assert!(text.starts_with("(kicad_sch\n"));

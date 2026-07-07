@@ -216,8 +216,8 @@ fn emit_sheet(
     for (name, at, down) in &routed.power_symbols {
         writer.add_power_symbol(name, *at, *down);
     }
-    for at in &routed.pwr_flags {
-        writer.add_pwr_flag(*at);
+    for (at, rot) in &routed.pwr_flags {
+        writer.add_pwr_flag(*at, *rot);
     }
     for at in &routed.no_connects {
         writer.add_no_connect(*at);

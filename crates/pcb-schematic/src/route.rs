@@ -52,7 +52,7 @@ pub struct RoutedSheet {
     pub global_labels: Vec<(String, Point, i32, PortDirection)>,
     pub hier_labels: Vec<(String, PortDirection, Point, i32)>,
     pub power_symbols: Vec<(String, Point, bool)>,
-    pub pwr_flags: Vec<Point>,
+    pub pwr_flags: Vec<(Point, i32)>,
     pub no_connects: Vec<Point>,
     pub blocks: Vec<BlockModel>,
     /// Graphic zone outlines (functional / decoupling / ERC), purely visual.
@@ -211,12 +211,15 @@ pub(crate) fn power_points_down(name: &str, class: NetClass) -> bool {
 
 /// Graphic footprint of a `PWR_FLAG` glyph anchored at its connection point
 /// (the flag and its wide value text hang above the point).
-pub(crate) fn pwr_flag_box(at: Point) -> BBox {
-    BBox {
-        x1: at.0 - 2.54,
-        y1: at.1 - 5.08,
-        x2: at.0 + 2.54,
-        y2: at.1 + 0.5,
+pub(crate) fn pwr_flag_box(at: Point, rot: i32) -> BBox {
+    // The pennant + wide value text hang on the side the glyph points to:
+    // above the connection point at rot 0, below when flipped (rot 180, used
+    // for ground flags so the pennant faces away from a wire arriving from
+    // above and the net no longer folds back over the symbol).
+    if rot == 180 {
+        BBox { x1: at.0 - 2.54, y1: at.1 - 0.5, x2: at.0 + 2.54, y2: at.1 + 5.08 }
+    } else {
+        BBox { x1: at.0 - 2.54, y1: at.1 - 5.08, x2: at.0 + 2.54, y2: at.1 + 0.5 }
     }
 }
 
@@ -1986,7 +1989,7 @@ impl<'a> Router<'a> {
             .unwrap_or((round4(symbol_at.0 + first_side * base), symbol_at.1));
         self.out.wires.push(vec![symbol_at, chosen]);
         self.reg.register_path(&[symbol_at, chosen], net);
-        self.out.pwr_flags.push(chosen);
+        self.out.pwr_flags.push((chosen, 0));
         self.reg
             .power_boxes
             .push((flag_box(chosen), net.to_string()));
@@ -2101,18 +2104,19 @@ impl<'a> Router<'a> {
             let flag_link = vec![sym_at, sym_knee, flag_knee, flag_at];
             self.reg.register_path(&flag_link, name);
             self.out.wires.push(flag_link);
-            self.out.pwr_flags.push(flag_at);
+            let flag_rot = if down { 180 } else { 0 };
+            self.out.pwr_flags.push((flag_at, flag_rot));
             self.reg
                 .power_boxes
-                .push((pwr_flag_box(flag_at), name.clone()));
+                .push((pwr_flag_box(flag_at, flag_rot), name.clone()));
             y = cfg.snap(y + cfg.utility_pitch_mm);
         }
         // Record the ERC band for the zone outline.
-        let flags: Vec<Point> = self.out.pwr_flags[flag_start..].to_vec();
+        let flags: Vec<(Point, i32)> = self.out.pwr_flags[flag_start..].to_vec();
         let syms: Vec<(String, Point, bool)> = self.out.power_symbols[sym_start..].to_vec();
         let mut region: Option<BBox> = None;
-        for f in flags {
-            union_opt(&mut region, &pwr_flag_box(f));
+        for (f, rot) in flags {
+            union_opt(&mut region, &pwr_flag_box(f, rot));
         }
         for (name, at, down) in syms {
             union_opt(&mut region, &power_symbol_graphic_box(&name, at, down));
@@ -2156,9 +2160,9 @@ impl<'a> Router<'a> {
                 union_opt(&mut func, &power_symbol_graphic_box(name, *at, *down));
             }
         }
-        for &at in &self.out.pwr_flags {
+        for &(at, rot) in &self.out.pwr_flags {
             if at.0 < seam_raw {
-                union_opt(&mut func, &pwr_flag_box(at));
+                union_opt(&mut func, &pwr_flag_box(at, rot));
             }
         }
         for (name, at, rot) in &self.out.net_labels {
@@ -2232,7 +2236,7 @@ impl<'a> Router<'a> {
                 func_ax2 = func_ax2.max(at.0);
             }
         }
-        for &at in &self.out.pwr_flags {
+        for &(at, _rot) in &self.out.pwr_flags {
             if in_util(at) {
                 util_ax1 = util_ax1.min(at.0);
             } else {
@@ -2617,13 +2621,8 @@ impl<'a> Router<'a> {
         for (name, at, down) in &self.out.power_symbols {
             grow(power_symbol_graphic_box(name, *at, *down));
         }
-        for f in &self.out.pwr_flags {
-            grow(BBox {
-                x1: f.0 - 2.54,
-                y1: f.1 - 5.08,
-                x2: f.0 + 2.54,
-                y2: f.1 + 0.5,
-            });
+        for &(f, rot) in &self.out.pwr_flags {
+            grow(pwr_flag_box(f, rot));
         }
         for b in &self.out.blocks {
             grow(BBox {

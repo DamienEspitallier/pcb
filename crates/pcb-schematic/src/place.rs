@@ -54,6 +54,12 @@ pub struct PlacedComp {
     pub ref_at: (f64, f64),
     pub value_at: (f64, f64),
     pub value_justify_right: bool,
+    /// Reference text is right-justified (anchor is its RIGHT edge). Set when
+    /// the lateral text fallback drops the block to the LEFT of the body: the
+    /// texts then glue their right edge to the component (symmetric with the
+    /// right-side block, which reads left-justified). The canonical Reference
+    /// is always left-justified, so this defaults to false.
+    pub ref_justify_right: bool,
 }
 
 /// One net as seen from a sheet.
@@ -322,6 +328,7 @@ pub fn place_sheet(
                 ref_at: (0.0, 0.0),
                 value_at: (0.0, 0.0),
                 value_justify_right: false,
+                ref_justify_right: false,
             }
         })
         .collect();
@@ -1941,6 +1948,7 @@ impl<'a> Engine<'a> {
         placed.ref_at = ref_at;
         placed.value_at = value_at;
         placed.value_justify_right = right;
+        placed.ref_justify_right = false;
     }
 }
 

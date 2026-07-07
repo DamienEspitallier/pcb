@@ -185,9 +185,15 @@ fn emit_sheet(
             uuid_key: &comp.path_key,
             ref_at: Some(placed.ref_at),
             value_at: Some(placed.value_at),
-            // Reference: anchored bottom-left (text above the anchor);
-            // Value: anchored top (text below), left or right justified.
-            ref_justify: &["left", "bottom"],
+            // Reference: anchored bottom (text above the anchor), left or right
+            // justified; Value: anchored top (text below), left or right
+            // justified. A left-side lateral block right-justifies both so its
+            // right edge glues to the component.
+            ref_justify: if placed.ref_justify_right {
+                &["right", "bottom"]
+            } else {
+                &["left", "bottom"]
+            },
             value_justify: if placed.value_justify_right {
                 &["right", "top"]
             } else {
@@ -228,7 +234,10 @@ fn emit_sheet(
     for zone in &routed.zones {
         writer.add_zone_rect((zone.bbox.x1, zone.bbox.y1), (zone.bbox.x2, zone.bbox.y2));
         if let Some(title) = &zone.title {
-            writer.add_zone_title(title, (zone.bbox.x1 + 0.5, zone.bbox.y1 - 0.5));
+            // Inside the top-left corner (top-left justify → text hangs down),
+            // just below the top edge, so the title never leaks into the cell
+            // above it (the ERC title used to fall into Decoupling).
+            writer.add_zone_title(title, (zone.bbox.x1 + 0.5, zone.bbox.y1 + 0.5));
         }
     }
 
@@ -676,6 +685,25 @@ mod tests {
         out
     }
 
+    /// Zone titles as (name, x, y) — the graphic text nodes named after a zone.
+    fn zone_titles(content: &str) -> Vec<(String, f64, f64)> {
+        let mut out = Vec::new();
+        for name in ["Functional", "Decoupling", "ERC"] {
+            let Some(idx) = content.find(&format!("(text \"{name}\"")) else {
+                continue;
+            };
+            let tail = &content[idx..];
+            let Some(at) = tail.lines().find(|l| l.trim_start().starts_with("(at ")) else {
+                continue;
+            };
+            let mut it = at.trim().trim_start_matches("(at ").split_whitespace();
+            let x = it.next().and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+            let y = it.next().and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+            out.push((name.to_string(), x, y));
+        }
+        out
+    }
+
     /// Consecutive wire endpoints as ((x1,y1),(x2,y2)).
     fn wire_segments(content: &str) -> Vec<((f64, f64), (f64, f64))> {
         let mut out = Vec::new();
@@ -972,9 +1000,14 @@ mod tests {
     }
 
     #[test]
-    fn zones_form_a_shared_edge_grid() {
-        // #5: the three zones tile a grid — functional on the left, decoupling
-        // over erc in the right column — sharing their dividing edges.
+    fn zones_form_a_gapped_grid() {
+        // TWEAK 1 (gap): the three zones tile a grid — functional on the left,
+        // decoupling over erc in the right column — but adjacent cells no longer
+        // share a seam. A two-grid-step channel (the default `zone_gap_mm`,
+        // 2.54 mm) opens between them so their dashed outlines stop
+        // superimposing, while the cells stay mutually disjoint and each still
+        // encloses its content. Here the free space easily fits the full gap on
+        // BOTH seams.
         let out = generate_schematic(&decoupled_adc(), &SchOptions::new("grid")).unwrap();
         let z = zone_rects(&out.files[0].content);
         assert_eq!(z.len(), 3);
@@ -983,27 +1016,24 @@ mod tests {
         right.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()); // top first
         let (top, bot) = (right[0], right[1]); // decoupling over erc
         let close = |a: f64, b: f64| (a - b).abs() < 0.01;
-        // The right column's two cells share their left and right edges.
+        let gap = 2.54; // two grid steps
+        // The right column's two cells still share their left and right edges.
         assert!(close(top.0, bot.0), "utility cells share the left edge");
         assert!(close(top.2, bot.2), "utility cells share the right edge");
         // Functional spans the full height; the outer top/bottom are shared.
         assert!(close(func.1, top.1), "functional/decoupling share the top");
         assert!(close(func.3, bot.3), "functional/erc share the bottom");
-        // #5: column and row seams are SHARED EDGES — the cells abut exactly,
-        // never overlapping (the earlier code let a stray stub overlap the
-        // cells; the zones must now be mutually disjoint) and never leaving a
-        // hole. With the default zero channel each seam is a single line.
+        // Column and row seams are CHANNELS of exactly two grid steps — never a
+        // shared line — so the dashed outlines are visibly separated.
         assert!(
-            close(func.2, top.0),
-            "functional/utility column seam is not a shared edge ({} vs {})",
-            func.2,
-            top.0
+            close(top.0 - func.2, gap),
+            "functional/utility column gap is not two grid steps ({} vs {gap})",
+            top.0 - func.2
         );
         assert!(
-            close(top.3, bot.1),
-            "decoupling/erc row seam is not a shared edge ({} vs {})",
-            top.3,
-            bot.1
+            close(bot.1 - top.3, gap),
+            "decoupling/erc row gap is not two grid steps ({} vs {gap})",
+            bot.1 - top.3
         );
         // No pair of zone rectangles overlaps (positive-area intersection).
         let overlaps = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
@@ -1014,6 +1044,46 @@ mod tests {
                 assert!(!overlaps(*a, *b), "zones {a:?} and {b:?} overlap");
             }
         }
+    }
+
+    #[test]
+    fn zone_titles_sit_inside_their_rectangle() {
+        // TWEAK 1 (title inside): every zone title is anchored INSIDE its own
+        // rectangle, just below the top edge (top-left justify → the text hangs
+        // down), never above the top edge where a lower cell's title (ERC, under
+        // Decoupling) used to drop into its neighbour.
+        let out = generate_schematic(&decoupled_adc(), &SchOptions::new("title")).unwrap();
+        let c = &out.files[0].content;
+        let zones = zone_rects(c);
+        assert_eq!(zones.len(), 3);
+        let titles = zone_titles(c);
+        assert_eq!(titles.len(), 3, "three zone titles");
+        // Each title anchor sits within some zone rectangle...
+        for (name, x, y) in &titles {
+            let inside = zones.iter().any(|z| {
+                *x >= z.0 - 0.01 && *x <= z.2 + 0.01 && *y >= z.1 - 0.01 && *y <= z.3 + 0.01
+            });
+            assert!(
+                inside,
+                "title {name} at ({x},{y}) is not inside any zone rect"
+            );
+        }
+        // ...and specifically the ERC title is in the lower-right (ERC) cell,
+        // below its top edge — not in the Decoupling cell above it.
+        let mut right = [zones[1], zones[2]];
+        right.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let erc = right[1]; // lower cell
+        let (_, ex, ey) = titles
+            .iter()
+            .find(|(n, _, _)| n == "ERC")
+            .expect("ERC title");
+        assert!(
+            *ex >= erc.0 - 0.01
+                && *ex <= erc.2 + 0.01
+                && *ey >= erc.1 + 0.01
+                && *ey <= erc.3 + 0.01,
+            "ERC title at ({ex},{ey}) must sit inside the ERC cell {erc:?}, below its top edge"
+        );
     }
 
     #[test]

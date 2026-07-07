@@ -264,10 +264,12 @@ pub struct SchConfig {
     /// Gap between adjacent cells of the zone grid. Zones are laid out as a
     /// table (functional flow on the left, the utility column split into
     /// decoupling over ERC on the right); with a gap of 0 the neighbouring
-    /// cells share their dividing edge (the tidy look of the reference
-    /// layout), a positive value opens a channel between them. The gap never
-    /// eats into a cell's content — it is capped by the free space between the
-    /// two contents it separates.
+    /// cells share their dividing edge, a positive value opens a channel
+    /// between them. Defaults to two grid steps (2.54 mm) so the dashed
+    /// outlines of adjacent zones no longer superimpose on the shared seam —
+    /// each cell retracts by half the gap on the seam it shares, staying
+    /// mutually DISJOINT. The gap never eats into a cell's content — it is
+    /// capped by the free space between the two contents it separates.
     pub zone_gap_mm: f64,
     /// Zone outlines snap their outer edges outward to this grid so the cells
     /// line up cleanly. Set to 0 to disable snapping. The inner dividers stay
@@ -326,7 +328,7 @@ impl Default for SchConfig {
             utility_gap_mm: 12.7,
             utility_pitch_mm: 12.7,
             zone_margin_mm: 3.81,
-            zone_gap_mm: 0.0,
+            zone_gap_mm: 2.54,
             zone_snap_mm: 1.27,
         }
     }
@@ -465,11 +467,13 @@ mod tests {
         assert!(cfg.dedup_signal_labels);
         let dd: SchConfig = toml_str_subset("dedup-signal-labels = false\n");
         assert!(!dd.dedup_signal_labels);
-        // Zone-grid knobs, kebab-case, defaulted and overridable.
-        assert_eq!(cfg.zone_gap_mm, 0.0);
+        // Zone-grid knobs, kebab-case, defaulted and overridable. The default
+        // gap is two grid steps so adjacent zone outlines no longer share a
+        // seam (their dashed strokes stop superimposing).
+        assert_eq!(cfg.zone_gap_mm, 2.54);
         assert_eq!(cfg.zone_snap_mm, 1.27);
-        let zg: SchConfig = toml_str_subset("zone-gap-mm = 2.54\nzone-snap-mm = 2.54\n");
-        assert_eq!(zg.zone_gap_mm, 2.54);
+        let zg: SchConfig = toml_str_subset("zone-gap-mm = 5.08\nzone-snap-mm = 2.54\n");
+        assert_eq!(zg.zone_gap_mm, 5.08);
         assert_eq!(zg.zone_snap_mm, 2.54);
     }
 

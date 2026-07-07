@@ -169,7 +169,11 @@ pub(crate) fn power_symbol_graphic_box(net_name: &str, at: Point, down: bool) ->
 pub(crate) fn placed_full_box(design: &DesignModel, p: &PlacedComp) -> BBox {
     let comp = &design.comps[p.comp];
     let mut b = p.bbox;
-    b.union(&crate::texts::ref_text_box(&comp.refdes, p.ref_at));
+    b.union(&crate::texts::ref_text_box(
+        &comp.refdes,
+        p.ref_at,
+        p.ref_justify_right,
+    ));
     b.union(&crate::texts::value_text_box(
         &comp.value,
         p.value_at,

@@ -76,13 +76,26 @@ fn union_box(a: &BBox, b: &BBox) -> BBox {
     out
 }
 
-/// Reference text box (bottom-left anchor: text above, to the right).
-pub(crate) fn ref_text_box(name: &str, at: Point) -> BBox {
-    BBox {
-        x1: at.0,
-        y1: at.1 - 2.2,
-        x2: at.0 + label_text_width(name),
-        y2: at.1 + 0.4,
+/// Reference text box. Left-justified (default): bottom-left anchor, text
+/// above and to the right. Right-justified: bottom-right anchor, text above
+/// and to the LEFT (used by the left-side lateral fallback so the block's
+/// right edge glues to the component).
+pub(crate) fn ref_text_box(name: &str, at: Point, justify_right: bool) -> BBox {
+    let w = label_text_width(name);
+    if justify_right {
+        BBox {
+            x1: at.0 - w,
+            y1: at.1 - 2.2,
+            x2: at.0,
+            y2: at.1 + 0.4,
+        }
+    } else {
+        BBox {
+            x1: at.0,
+            y1: at.1 - 2.2,
+            x2: at.0 + w,
+            y2: at.1 + 0.4,
+        }
     }
 }
 
@@ -464,7 +477,7 @@ pub(crate) fn place_instance_texts(
         let (ref_at, value_at, justify_right) = canonical_anchors(cfg, design, p);
         let refdes = &design.comps[p.comp].refdes;
         let value = &design.comps[p.comp].value;
-        let ref_box = ref_text_box(refdes, ref_at);
+        let ref_box = ref_text_box(refdes, ref_at, false);
         let val_box = value_text_box(value, value_at, justify_right);
         let static_hit = |bbox: &BBox| -> bool {
             for (oi, rb) in raw_boxes.iter().enumerate() {
@@ -501,7 +514,8 @@ pub(crate) fn place_instance_texts(
     }
 
     let mut label_boxes: Vec<LabelBox> = Vec::new();
-    let mut outcomes: Vec<(Point, Point, bool)> = Vec::with_capacity(model.placed.len());
+    // (ref anchor, ref justify-right, value anchor, value justify-right).
+    let mut outcomes: Vec<(Point, bool, Point, bool)> = Vec::with_capacity(model.placed.len());
     for pi in 0..model.placed.len() {
         let p = &model.placed[pi];
         let comp = &design.comps[p.comp];
@@ -594,38 +608,61 @@ pub(crate) fn place_instance_texts(
         let ref_k_max = 1.max(3.min(((plan_ref.1 - (raw.y1 - 2.0 * g)) / g + EPS).floor() as i32));
         let val_k_max = 1.max(3.min(((raw.y2 + 2.0 * g - plan_val.1) / g + EPS).floor() as i32));
 
-        let refdes_box = |at: Point| ref_text_box(&refdes, at);
+        let refdes_box = |at: Point| ref_text_box(&refdes, at, false);
         let value_box = |at: Point| value_text_box(&value, at, justify_right);
         let coll = |bbox: &BBox| collides(bbox, &label_boxes);
         let (ref_at, ref_bbox, ref_ok) = slide(&coll, plan_ref, -1.0, &refdes_box, ref_k_max);
         let (val_at, val_bbox, val_ok) = slide(&coll, plan_val, 1.0, &value_box, val_k_max);
 
-        let mut chosen = (ref_at, ref_bbox, val_at, val_bbox, justify_right, false);
+        let mut chosen = (
+            ref_at,
+            ref_bbox,
+            false,
+            val_at,
+            val_bbox,
+            justify_right,
+            false,
+        );
         if !ref_ok || !val_ok {
-            // LATERAL FALLBACK: ref above value, left-justified, right of
-            // the body (grid x), stepped right until collision-free; then
-            // the same on the LEFT side (never into the left page margin);
-            // rescue spot glued to the right edge.
+            // LATERAL FALLBACK: ref above value, centered on the body axis so a
+            // middle-pin wire passes between the two lines. Try the RIGHT of the
+            // body first (block LEFT-justified, its left edge stepped rightward
+            // off the body), then the LEFT (block RIGHT-justified, its right
+            // edge glued one grid step off the body then stepped leftward, never
+            // into the left page margin), then a rescue spot glued to the right
+            // edge. Left-justifying on the right and right-justifying on the
+            // left keeps the block's INNER edge against the component on either
+            // side, so a left-side block reads as symmetric with a right-side
+            // one (the engineer's C2 tweak) instead of trailing a ragged right
+            // edge far from the body.
             let cy = round4((body.y1 + body.y2) / 2.0);
-            let x0 = round4(((body.x2 + g) / g - 1e-6).ceil() * g);
-            let mut xs: Vec<f64> = (0..=8).map(|k| round4(x0 + k as f64 * g)).collect();
             let max_w = label_text_width(&refdes).max(label_text_width(&value));
-            let x0l = round4(((body.x1 - g - max_w) / g + 1e-6).floor() * g);
+            // (anchor_x, justify_right). Right side: anchor is the block's LEFT
+            // edge, stepped rightward, left-justified.
+            let x0 = round4(((body.x2 + g) / g - 1e-6).ceil() * g);
+            let mut cands: Vec<(f64, bool)> = (0..=8)
+                .map(|k| (round4(x0 + k as f64 * g), false))
+                .collect();
+            // Left side: anchor is the block's RIGHT edge, one grid step off the
+            // body then stepped leftward, right-justified. The widest line's
+            // left edge must stay within the page margin.
+            let x0r = round4(((body.x1 - g) / g + 1e-6).floor() * g);
             for k in 0..=8 {
-                let xl = round4(x0l - k as f64 * g);
-                if xl >= cfg.margin_left_mm {
-                    xs.push(xl);
+                let xr = round4(x0r - k as f64 * g);
+                if xr - max_w >= cfg.margin_left_mm {
+                    cands.push((xr, true));
                 }
             }
-            xs.push(round4((body.x2 / g - 1e-6).ceil() * g));
+            // Rescue: glued to the right edge, left-justified.
+            cands.push((round4((body.x2 / g - 1e-6).ceil() * g), false));
             let mut lateral = None;
-            for x in xs {
+            for (x, jr) in cands {
                 let r_at = (x, round4(cy - 0.8));
                 let v_at = (x, round4(cy + 0.8));
-                let r_box = ref_text_box(&refdes, r_at);
-                let v_box = value_text_box(&value, v_at, false);
+                let r_box = ref_text_box(&refdes, r_at, jr);
+                let v_box = value_text_box(&value, v_at, jr);
                 if !collides(&r_box, &label_boxes) && !collides(&v_box, &label_boxes) {
-                    lateral = Some((r_at, r_box, v_at, v_box, false, false));
+                    lateral = Some((r_at, r_box, jr, v_at, v_box, jr, false));
                     break;
                 }
             }
@@ -637,7 +674,7 @@ pub(crate) fn place_instance_texts(
                     let soft = |bbox: &BBox| soft_collides(bbox, &label_boxes);
                     let (r_at, r_box, _) = slide(&soft, plan_ref, -1.0, &refdes_box, ref_k_max);
                     let (v_at, v_box, _) = slide(&soft, plan_val, 1.0, &value_box, val_k_max);
-                    chosen = (r_at, r_box, v_at, v_box, justify_right, true);
+                    chosen = (r_at, r_box, false, v_at, v_box, justify_right, true);
                     // Warn on realistic overlap only: foreign bodies/texts/
                     // graphic footprints. The maximal foreign corridor is an
                     // upper bound — the wiring can shorten or jog around.
@@ -662,7 +699,7 @@ pub(crate) fn place_instance_texts(
                         }
                         false
                     };
-                    if warn_hit(&chosen.1) || warn_hit(&chosen.3) {
+                    if warn_hit(&chosen.1) || warn_hit(&chosen.4) {
                         warnings.push(format!(
                             "texts of {refdes} kept at their canonical spot despite an overlap"
                         ));
@@ -671,8 +708,9 @@ pub(crate) fn place_instance_texts(
             }
         }
 
-        let (ref_at, ref_bbox, val_at, val_bbox, justify_right, last_resort) = chosen;
-        outcomes.push((ref_at, val_at, justify_right));
+        let (ref_at, ref_bbox, ref_justify_right, val_at, val_bbox, justify_right, last_resort) =
+            chosen;
+        outcomes.push((ref_at, ref_justify_right, val_at, justify_right));
 
         // Last resort: the box lets its OWN stubs through (multi-net tag);
         // a cleanly placed text stays a hard obstacle for everyone.
@@ -718,11 +756,14 @@ pub(crate) fn place_instance_texts(
         });
     }
 
-    for (pi, (ref_at, value_at, justify_right)) in outcomes.into_iter().enumerate() {
+    for (pi, (ref_at, ref_justify_right, value_at, justify_right)) in
+        outcomes.into_iter().enumerate()
+    {
         let placed = &mut model.placed[pi];
         placed.ref_at = ref_at;
         placed.value_at = value_at;
         placed.value_justify_right = justify_right;
+        placed.ref_justify_right = ref_justify_right;
     }
 
     TextArtifacts {
@@ -737,14 +778,101 @@ mod tests {
 
     #[test]
     fn text_boxes_extend_from_their_anchor() {
-        let r = ref_text_box("R1", (10.0, 20.0));
+        let r = ref_text_box("R1", (10.0, 20.0), false);
         assert!(r.x1 == 10.0 && r.x2 > 10.0);
         assert!(r.y1 < 20.0 && r.y2 > 20.0 - 1e-9);
+        // Right-justified reference: anchor is the RIGHT edge, text extends left.
+        let r_right = ref_text_box("R1", (10.0, 20.0), true);
+        assert!(r_right.x2 == 10.0 && r_right.x1 < 10.0);
+        assert!(r_right.y1 < 20.0 && r_right.y2 > 20.0 - 1e-9);
         let v_right = value_text_box("10k", (30.0, 40.0), true);
         assert!(v_right.x2 == 30.0 && v_right.x1 < 30.0);
         assert!(v_right.y2 > 40.0);
         let v_left = value_text_box("10k", (30.0, 40.0), false);
         assert!(v_left.x1 == 30.0 && v_left.x2 > 30.0);
+    }
+
+    #[test]
+    fn left_side_lateral_block_is_right_justified() {
+        // TWEAK 2: when the lateral text fallback drops a component's
+        // Reference/Value block to the LEFT of its body, both texts must be
+        // RIGHT-justified so their right edge glues to the component (symmetric
+        // with a right-side block, which stays left-justified). We box a shunt
+        // cap against the LEFT edge of a wide wall: a foreign body below the cap
+        // makes its canonical text collide (lateral fires) and every right-side
+        // lateral candidate lands inside the wall body, so the only free spot is
+        // on the cap's left.
+        use crate::place::place_sheet;
+        use crate::sheets::plan_sheets;
+        let sch = crate::testkit::cap_boxed_by_wall();
+        let cfg = SchConfig::default();
+        let design = DesignModel::build(&sch, &cfg).unwrap();
+        let mut warnings = Vec::new();
+        let plan = plan_sheets(&sch, &design, &cfg, "t", &mut warnings);
+        let mut model = place_sheet(&design, &plan, 0, &cfg, &mut warnings);
+
+        let wall = model
+            .placed
+            .iter()
+            .position(|p| design.comps[p.comp].refdes == "U1")
+            .expect("wall placed");
+        let cap = model
+            .placed
+            .iter()
+            .position(|p| design.comps[p.comp].refdes == "C1")
+            .expect("cap placed");
+        let blocker = model
+            .placed
+            .iter()
+            .position(|p| design.comps[p.comp].refdes == "R1")
+            .expect("blocker placed");
+
+        // Lay out the trio by hand (absolute positions), leaving ample room to
+        // the cap's LEFT — well clear of the page margin so left candidates are
+        // not filtered out. The cap sits at the wall's mid-height (between the
+        // wall's two right-edge pins, and the wall projects no left-edge lane),
+        // flush against the wall's left edge; a passive body sits just below the
+        // cap to block its canonical text spot.
+        let cx = 60.0;
+        let cy = 100.0;
+        model.placed[cap].at = (cx, cy);
+        model.placed[cap].rotation = 0;
+        model.placed[cap].mirror = None;
+        // Wall to the right: its body left edge three grid units off the cap.
+        model.placed[wall].at = (round4(cx + 3.0 + 10.16), cy);
+        model.placed[wall].rotation = 0;
+        model.placed[wall].mirror = None;
+        // Foreign body just below the cap (a component's own corridor never
+        // blocks its own text, so we need a neighbour).
+        model.placed[blocker].at = (cx, round4(cy + 6.0));
+        model.placed[blocker].rotation = 0;
+        model.placed[blocker].mirror = None;
+
+        place_instance_texts(&cfg, &design, &mut model, &mut warnings);
+
+        let c = &model.placed[cap];
+        // The block dropped to the LEFT of the body...
+        assert!(
+            c.ref_at.0 <= c.at.0 && c.value_at.0 <= c.at.0,
+            "the lateral block must sit left of the cap body (ref_x={}, val_x={}, body_x={})",
+            c.ref_at.0,
+            c.value_at.0,
+            c.at.0
+        );
+        // ...and therefore both texts are RIGHT-justified (right edge glued to
+        // the body), the anchor being the block's right edge.
+        assert!(
+            c.ref_justify_right,
+            "left-side lateral Reference must be right-justified"
+        );
+        assert!(
+            c.value_justify_right,
+            "left-side lateral Value must be right-justified"
+        );
+        // Right-justified boxes extend LEFT of their anchor, so the whole block
+        // sits left of its right edge, which hugs the body.
+        let refbox = ref_text_box(&design.comps[c.comp].refdes, c.ref_at, c.ref_justify_right);
+        assert!(refbox.x2 <= c.at.0 + EPS && refbox.x1 < refbox.x2);
     }
 
     #[test]

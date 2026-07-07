@@ -64,6 +64,22 @@ pub const TIGHT_PORTS: &str = r#"(symbol "TightPorts"
             (name "RST" (effects (font (size 1.27 1.27))))
             (number "3" (effects (font (size 1.27 1.27)))))))"#;
 
+/// A tall, wide box with BOTH pins on its RIGHT edge — its left edge carries no
+/// pin, hence no left-facing stub lane. Used to wall a neighbour's right side
+/// without projecting a keepout onto its left (so a boxed-in cap's lateral text
+/// can drop cleanly to the left).
+pub const WALL: &str = r#"(symbol "Wall"
+    (symbol "Wall_0_1"
+        (rectangle (start -10.16 15.24) (end 10.16 -15.24)
+            (stroke (width 0.254) (type default)) (fill (type background))))
+    (symbol "Wall_1_1"
+        (pin passive line (at 12.7 10.16 180) (length 2.54)
+            (name "A" (effects (font (size 1.27 1.27))))
+            (number "1" (effects (font (size 1.27 1.27)))))
+        (pin passive line (at 12.7 -10.16 180) (length 2.54)
+            (name "B" (effects (font (size 1.27 1.27))))
+            (number "2" (effects (font (size 1.27 1.27)))))))"#;
+
 fn module_ref() -> ModuleRef {
     ModuleRef::from_path(Path::new("/test.zen"), "<root>")
 }
@@ -396,6 +412,49 @@ pub fn adc_pullup_over_analog() -> Schematic {
         Net::new("Ground".to_string(), "GND", 5)
             .with_port(port_ref(&["U1"], "GND"))
             .with_port(port_ref(&["CIN"], "2")),
+    );
+    sch.assign_reference_designators();
+    sch
+}
+
+/// A shunt cap next to a wide wall (a box with pins only on its right edge, so
+/// its left side projects no stub lane) plus a second passive to sit below the
+/// cap. The test repositions these three parts so the cap is boxed against the
+/// wall's left edge with the passive below it: its canonical text collides and
+/// every right-side lateral spot is walled, forcing the block to the cap's LEFT
+/// (where it must right-justify). Reproduces the AD7171 C2 lateral in a
+/// controlled, self-contained way.
+pub fn cap_boxed_by_wall() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    let u1 = add_component(
+        &mut sch,
+        &["U1"],
+        WALL,
+        &[("A", "1"), ("B", "2")],
+        "WALL",
+        None,
+    );
+    let c1 = add_c(&mut sch, &["C1"], "100pF"); // the boxed-in shunt cap
+    let r1 = add_r(&mut sch, &["R1"], "10k"); // a passive body to block below
+    for (n, r) in [("U1", u1), ("C1", c1), ("R1", r1)] {
+        root_inst.add_child(n.to_string(), r);
+    }
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    sch.add_net(
+        Net::new("Net".to_string(), "SIG", 1)
+            .with_port(port_ref(&["U1"], "A"))
+            .with_port(port_ref(&["C1"], "1"))
+            .with_port(port_ref(&["R1"], "1")),
+    );
+    sch.add_net(
+        Net::new("Ground".to_string(), "GND", 2)
+            .with_port(port_ref(&["U1"], "B"))
+            .with_port(port_ref(&["C1"], "2"))
+            .with_port(port_ref(&["R1"], "2")),
     );
     sch.assign_reference_designators();
     sch

@@ -501,8 +501,12 @@ impl SheetWriter {
         ));
     }
 
-    /// Discreet title for a zone, left/bottom anchored just above its top-left
-    /// corner on the graphic layer. Purely visual — no connectivity.
+    /// Discreet title for a zone, left/top anchored just INSIDE its top-left
+    /// corner on the graphic layer (the text hangs down from the anchor, so it
+    /// stays within the rectangle). Anchoring it inside — rather than above the
+    /// top edge — keeps a lower zone's title (ERC, sitting under Decoupling)
+    /// from dropping into the neighbouring cell. Purely visual — no
+    /// connectivity.
     pub fn add_zone_title(&mut self, text: &str, at: (f64, f64)) {
         let (x, y) = (round4(at.0), round4(at.1));
         let uuid = self.uuids.next(&["ztitle", text, &format!("{x},{y}")]);
@@ -512,7 +516,7 @@ impl SheetWriter {
                 sstr(text),
                 node("exclude_from_sim", vec![sym("no")]),
                 node("at", vec![num(x), num(y), int(0)]),
-                effects(&["left", "bottom"], false),
+                effects(&["left", "top"], false),
                 node("uuid", vec![sstr(&uuid)]),
             ],
         ));

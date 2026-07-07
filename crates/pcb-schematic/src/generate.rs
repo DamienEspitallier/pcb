@@ -265,7 +265,8 @@ mod tests {
     use crate::model::ATTR_SYMBOL_VALUE;
     use crate::testkit::{
         adc_dout_congested, adc_pullup_over_analog, analog_filter, decoupled_adc, diff_filter,
-        digital_bus, divider, hierarchical_design, split_rail_ic,
+        digital_bus, divider, hierarchical_design, sibling_ports_collide, sibling_ports_ic,
+        split_rail_ic,
     };
 
     /// X coordinate of a placed component symbol, found by its refdes. Reads the
@@ -806,6 +807,64 @@ mod tests {
                 "the flag link recesses at least two grid steps before its bend"
             );
         }
+    }
+
+    /// The two right-edge global labels of `sibling_ports_ic` (CLK over PDRST),
+    /// and the two left-edge ones (A_LONG over B).
+    fn edge_label_xs(content: &str) -> (Vec<f64>, Vec<f64>) {
+        let labels = labels_of(content, "global_label");
+        let x_of = |n: &str| labels.iter().find(|l| l.0 == n).map(|l| l.1);
+        (
+            ["CLK", "PDRST"].iter().filter_map(|n| x_of(n)).collect(),
+            ["A_LONG", "B"].iter().filter_map(|n| x_of(n)).collect(),
+        )
+    }
+
+    #[test]
+    fn sibling_ports_align_onto_a_common_column() {
+        // The engineer's soft rule: ports leaving the same side of the same
+        // component are pulled onto one X column (CLK/PDRST on the right, A_LONG/B
+        // on the left). The shorter stub grows outward to the extreme member.
+        let out = generate_schematic(&sibling_ports_ic(), &SchOptions::new("sib")).unwrap();
+        let (right, left) = edge_label_xs(&out.files[0].content);
+        assert_eq!(right.len(), 2, "both right ports emitted");
+        assert_eq!(left.len(), 2, "both left ports emitted");
+        assert!(
+            (right[0] - right[1]).abs() < 1e-6,
+            "CLK/PDRST share one X after alignment: {right:?}"
+        );
+        assert!(
+            (left[0] - left[1]).abs() < 1e-6,
+            "A_LONG/B share one X after alignment: {left:?}"
+        );
+
+        // With the pass disabled the natural stubs keep their different lengths,
+        // proving the alignment (not the router) put them on a common column.
+        let mut opts = SchOptions::new("sib");
+        opts.config.align_sibling_ports = false;
+        let raw = generate_schematic(&sibling_ports_ic(), &opts).unwrap();
+        let (right0, _left0) = edge_label_xs(&raw.files[0].content);
+        assert!(
+            (right0[0] - right0[1]).abs() > 1e-6,
+            "without the pass CLK/PDRST stay misaligned: {right0:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_port_alignment_is_skipped_when_it_would_collide() {
+        // Best-effort, no regression: pulling CLK and PDRESET onto one column
+        // would stack their labels a single grid step apart (the two pins sit one
+        // step apart) — a real text overlap. The pass must leave the group as the
+        // router drew it, so the two labels keep their different X.
+        let out = generate_schematic(&sibling_ports_collide(), &SchOptions::new("col")).unwrap();
+        let labels = labels_of(&out.files[0].content, "global_label");
+        let x = |n: &str| labels.iter().find(|l| l.0 == n).map(|l| l.1).unwrap();
+        assert!(
+            (x("CLK") - x("PDRESET")).abs() > 1e-6,
+            "the colliding group is left unaligned: CLK={} PDRESET={}",
+            x("CLK"),
+            x("PDRESET")
+        );
     }
 
     #[test]

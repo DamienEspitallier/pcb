@@ -115,6 +115,21 @@ pub struct SchConfig {
     /// shorter stub is stretched).
     pub power_align_max_dx_mm: f64,
     pub power_align_max_dy_mm: f64,
+    /// Soft alignment of sibling ports and net labels onto a shared X column.
+    /// After routing, ports (global/hierarchical labels) that leave the SAME
+    /// side of the SAME component are pulled onto one common vertical column
+    /// (the most extreme member's X — the shorter stubs lengthen outward to
+    /// reach it, the pin stays put so the netlist never moves), and sibling net
+    /// labels annotating parallel nets of one sub-circuit (near ordinates,
+    /// neighbouring X, same reading direction) slide along their own wire onto a
+    /// common X. Purely a graphical tidy-up: a stub only ever grows outward and a
+    /// net label only slides along the conductor it already names, so the
+    /// exported `(ref.pin)` net partition is byte-for-byte unchanged. The pass is
+    /// strictly best-effort — a group is aligned only when it introduces no frank
+    /// crossing, no text overlap and no foreign contact; any group that would
+    /// regress is left exactly as it was. Set false to keep every stub/label at
+    /// its routed length.
+    pub align_sibling_ports: bool,
     /// Order the power symbols of a cluster by electrical potential on the
     /// vertical axis and align same-potential symbols on a shared ordinate:
     /// positive rails (VDD/VCC/+…) ride at the top, grounds (GND/VSS) at the
@@ -281,6 +296,7 @@ impl Default for SchConfig {
             power_align_max_dx_mm: 25.4,
             power_align_max_dy_mm: 7.62,
             align_power_by_potential: true,
+            align_sibling_ports: true,
             label_elbow_mm: 2.54,
             crystal_gap_mm: 8.89,
             wire_length_guard_mm: 1016.0,
@@ -411,6 +427,10 @@ mod tests {
         assert!(cfg.align_power_by_potential);
         let ap: SchConfig = toml_str_subset("align-power-by-potential = false\n");
         assert!(!ap.align_power_by_potential);
+        // Sibling-port alignment knob, kebab-case, defaulted and overridable.
+        assert!(cfg.align_sibling_ports);
+        let asp: SchConfig = toml_str_subset("align-sibling-ports = false\n");
+        assert!(!asp.align_sibling_ports);
         // New foundation knob, kebab-case, defaulted and overridable.
         assert_eq!(cfg.input_chain_min_pins, 3);
         let ic: SchConfig = toml_str_subset("input-chain-min-pins = 5\n");

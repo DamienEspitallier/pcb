@@ -217,9 +217,19 @@ pub(crate) fn pwr_flag_box(at: Point, rot: i32) -> BBox {
     // for ground flags so the pennant faces away from a wire arriving from
     // above and the net no longer folds back over the symbol).
     if rot == 180 {
-        BBox { x1: at.0 - 2.54, y1: at.1 - 0.5, x2: at.0 + 2.54, y2: at.1 + 5.08 }
+        BBox {
+            x1: at.0 - 2.54,
+            y1: at.1 - 0.5,
+            x2: at.0 + 2.54,
+            y2: at.1 + 5.08,
+        }
     } else {
-        BBox { x1: at.0 - 2.54, y1: at.1 - 5.08, x2: at.0 + 2.54, y2: at.1 + 0.5 }
+        BBox {
+            x1: at.0 - 2.54,
+            y1: at.1 - 5.08,
+            x2: at.0 + 2.54,
+            y2: at.1 + 0.5,
+        }
     }
 }
 
@@ -376,6 +386,57 @@ pub(crate) fn hier_text_box(name: &str, at: Point, rotation: i32) -> BBox {
     }
 }
 
+/// Two axis-aligned text boxes collide only when they overlap by more than
+/// `tol` on BOTH axes. Sibling labels aligned onto one column sit two grid
+/// steps apart (2.54 mm) while the padded text box is a hair taller (2.6 mm),
+/// so their keepouts graze by ~0.06 mm — the reference layout stacks them just
+/// so. `tol` swallows that sub-grid graze while still catching a real overlap
+/// (two labels a single step apart, or one on top of another).
+pub(crate) fn boxes_collide_tol(a: &BBox, b: &BBox, tol: f64) -> bool {
+    let xo = a.x2.min(b.x2) - a.x1.max(b.x1);
+    let yo = a.y2.min(b.y2) - a.y1.max(b.y1);
+    xo > tol && yo > tol
+}
+
+fn near(a: Point, b: Point) -> bool {
+    (a.0 - b.0).abs() < EPS && (a.1 - b.1).abs() < EPS
+}
+
+/// Which routed-label vector an [`AlignItem`] lives in, and its index there.
+#[derive(Clone, Copy)]
+enum LabelSlot {
+    Global(usize),
+    Hier(usize),
+    Net(usize),
+}
+
+/// How a horizontal label anchors to a wire, and thus how it may move onto a
+/// shared X column without touching the netlist.
+#[derive(Clone, Copy)]
+enum AlignKind {
+    /// Terminal vertex of a horizontal stub off a component pin. `fixed` is the
+    /// inner (pin-side) end that stays put; extending the stub only grows the
+    /// segment outward. `wire`/`last` locate the vertex in `out.wires`.
+    Stub {
+        wire: usize,
+        last: bool,
+        fixed: Point,
+        comp: usize,
+    },
+    /// Interior point of a horizontal wire run spanning `[lo, hi]`; the label
+    /// slides along the conductor it already names (the wire never moves).
+    Interior { lo: f64, hi: f64 },
+}
+
+/// A label that is a candidate for soft column alignment.
+struct AlignItem {
+    slot: LabelSlot,
+    net: String,
+    at: Point,
+    rot: i32,
+    kind: AlignKind,
+}
+
 /// One endpoint of a net on the sheet: position + outward direction.
 #[derive(Clone)]
 pub(crate) struct Endpoint {
@@ -461,6 +522,10 @@ pub fn route_sheet(
     router.mark_no_connects();
     router.place_blocks();
     router.place_port_fallbacks();
+    // Soft pass: pull sibling ports / net labels onto a shared X column. Runs
+    // after every label is placed and before the zones are outlined so the
+    // functional cell encloses the final (aligned) label positions.
+    router.align_sibling_ports();
     // Outline the functional / decoupling / ERC zones once every element
     // (including the relegated flags placed by `route_power`) is positioned.
     router.compute_zones();
@@ -2594,6 +2659,437 @@ impl<'a> Router<'a> {
         }
     }
 
+    // --------------------------------------------------------------
+    // Soft sibling alignment (`align_sibling_ports`)
+    // --------------------------------------------------------------
+
+    /// Pull sibling ports / net labels onto a shared X column (see the config
+    /// doc). Best-effort: a group is aligned only when every member reaches the
+    /// common column without a frank crossing, a text overlap or a foreign
+    /// contact; any group that would regress is left untouched. Only stub
+    /// extension (pin fixed) and in-wire label sliding are used, so the netlist
+    /// is unchanged.
+    fn align_sibling_ports(&mut self) {
+        if !self.cfg.align_sibling_ports {
+            return;
+        }
+        let items = self.collect_align_items();
+        // Scope 1: ports leaving the same side of the same component.
+        for cluster in self.port_clusters(&items) {
+            self.try_align_cluster(&items, &cluster);
+        }
+        // Scope 2: sibling net-label annotations on parallel nets.
+        for cluster in self.net_label_clusters(&items) {
+            self.try_align_cluster(&items, &cluster);
+        }
+    }
+
+    /// Snapshot every horizontal label that can be column-aligned: ports
+    /// (global/hierarchical) that terminate a stub off a component pin, and
+    /// local net labels that sit inside a horizontal wire run.
+    fn collect_align_items(&self) -> Vec<AlignItem> {
+        let mut items = Vec::new();
+        for (i, (name, at, rot, _)) in self.out.global_labels.iter().enumerate() {
+            if let Some(kind) = self.classify_stub(*at, *rot) {
+                items.push(AlignItem {
+                    slot: LabelSlot::Global(i),
+                    net: name.clone(),
+                    at: *at,
+                    rot: *rot,
+                    kind,
+                });
+            }
+        }
+        for (i, (name, _dir, at, rot)) in self.out.hier_labels.iter().enumerate() {
+            if let Some(kind) = self.classify_stub(*at, *rot) {
+                items.push(AlignItem {
+                    slot: LabelSlot::Hier(i),
+                    net: name.clone(),
+                    at: *at,
+                    rot: *rot,
+                    kind,
+                });
+            }
+        }
+        for (i, (name, at, rot)) in self.out.net_labels.iter().enumerate() {
+            if let Some(kind) = self.classify_interior(name, *at, *rot) {
+                items.push(AlignItem {
+                    slot: LabelSlot::Net(i),
+                    net: name.clone(),
+                    at: *at,
+                    rot: *rot,
+                    kind,
+                });
+            }
+        }
+        items
+    }
+
+    /// Classify a label anchor as a horizontal stub end off a component pin.
+    /// Returns `None` unless `at` is the terminal vertex of exactly one wire,
+    /// its terminal segment is horizontal, the text reads outward off that end,
+    /// and the inner end is a real component pin.
+    fn classify_stub(&self, at: Point, rot: i32) -> Option<AlignKind> {
+        if rot != 0 && rot != 180 {
+            return None;
+        }
+        let mut found: Option<(usize, bool, Point)> = None;
+        let mut count = 0usize;
+        for (wi, w) in self.out.wires.iter().enumerate() {
+            if w.len() < 2 {
+                continue;
+            }
+            if near(w[0], at) {
+                let nb = w[1];
+                if (nb.1 - at.1).abs() < EPS && (nb.0 - at.0).abs() > EPS {
+                    found = Some((wi, false, nb));
+                    count += 1;
+                }
+            }
+            let last = *w.last().expect("len >= 2");
+            if near(last, at) {
+                let nb = w[w.len() - 2];
+                if (nb.1 - at.1).abs() < EPS && (nb.0 - at.0).abs() > EPS {
+                    found = Some((wi, true, nb));
+                    count += 1;
+                }
+            }
+        }
+        if count != 1 {
+            return None;
+        }
+        let (wire, last, fixed) = found?;
+        let outward = (at.0 - fixed.0).signum();
+        let read = if rot == 0 { 1.0 } else { -1.0 };
+        if (outward - read).abs() > EPS {
+            return None;
+        }
+        let comp = self.comp_at_pin(fixed)?;
+        Some(AlignKind::Stub {
+            wire,
+            last,
+            fixed,
+            comp,
+        })
+    }
+
+    /// Classify a net label as an interior annotation of a horizontal wire run
+    /// of its own net. Returns the run's `[lo, hi]` X-extent when the run is at
+    /// least as wide as the text (room to slide the label and stay underlined).
+    fn classify_interior(&self, name: &str, at: Point, rot: i32) -> Option<AlignKind> {
+        if rot != 0 && rot != 180 {
+            return None;
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut hit = false;
+        for s in &self.reg.segs {
+            if s.net != name || (s.y1 - s.y2).abs() >= EPS || (s.y1 - at.1).abs() >= EPS {
+                continue;
+            }
+            let (xlo, xhi) = (s.x1.min(s.x2), s.x1.max(s.x2));
+            if at.0 >= xlo - EPS && at.0 <= xhi + EPS {
+                lo = lo.min(xlo);
+                hi = hi.max(xhi);
+                hit = true;
+            }
+        }
+        if !hit || hi - lo < label_text_width(name) - EPS {
+            return None;
+        }
+        Some(AlignKind::Interior { lo, hi })
+    }
+
+    /// Placed component owning a visible pin at `p`, if any.
+    fn comp_at_pin(&self, p: Point) -> Option<usize> {
+        for (pi, pc) in self.model.placed.iter().enumerate() {
+            let geom = &self.design.comps[pc.comp].geom;
+            for pin in geom.pins.iter().filter(|pin| !pin.hidden) {
+                if let Some(pos) = geom.pin_position(&pin.number, pc.at, pc.rotation, pc.mirror)
+                    && near(pos, p)
+                {
+                    return Some(pi);
+                }
+            }
+        }
+        None
+    }
+
+    /// Sibling port clusters: stub labels grouped by (component, side, reading).
+    /// Only groups of two or more with a non-trivial but bounded X spread are
+    /// returned (a wider spread is an intentional detour, left alone).
+    fn port_clusters(&self, items: &[AlignItem]) -> Vec<Vec<usize>> {
+        let dx_window = 20.0 * self.cfg.grid_mm;
+        let mut groups: BTreeMap<(usize, i64, i32), Vec<usize>> = BTreeMap::new();
+        for (idx, it) in items.iter().enumerate() {
+            if let AlignKind::Stub { comp, fixed, .. } = it.kind {
+                let outward = (it.at.0 - fixed.0).signum() as i64;
+                groups.entry((comp, outward, it.rot)).or_default().push(idx);
+            }
+        }
+        let mut clusters = Vec::new();
+        for members in groups.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let xs: Vec<f64> = members.iter().map(|&i| items[i].at.0).collect();
+            let mn = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if mx - mn <= EPS || mx - mn > dx_window + EPS {
+                continue;
+            }
+            clusters.push(members);
+        }
+        clusters
+    }
+
+    /// Sibling net-label clusters: interior annotations of parallel nets that
+    /// share a reading direction, sit on neighbouring rows and columns, and run
+    /// over a common X band. Clustered by proximity (union-find).
+    fn net_label_clusters(&self, items: &[AlignItem]) -> Vec<Vec<usize>> {
+        let interior: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it.kind, AlignKind::Interior { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let dx_window = 20.0 * self.cfg.grid_mm;
+        let dy_window = 6.0 * self.cfg.grid_mm;
+        let n = interior.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], a: usize) -> usize {
+            let mut r = a;
+            while parent[r] != r {
+                r = parent[r];
+            }
+            let mut c = a;
+            while parent[c] != c {
+                let next = parent[c];
+                parent[c] = r;
+                c = next;
+            }
+            r
+        }
+        let siblings = |a: usize, b: usize| -> bool {
+            let (ia, ib) = (&items[interior[a]], &items[interior[b]]);
+            let AlignKind::Interior { lo: la, hi: ha } = ia.kind else {
+                return false;
+            };
+            let AlignKind::Interior { lo: lb, hi: hb } = ib.kind else {
+                return false;
+            };
+            ia.rot == ib.rot
+                && ia.net != ib.net
+                && (ia.at.1 - ib.at.1).abs() > EPS
+                && (ia.at.1 - ib.at.1).abs() <= dy_window + EPS
+                && (ia.at.0 - ib.at.0).abs() <= dx_window + EPS
+                // the two runs overlap over a common X band (genuine parallels)
+                && la.max(lb) < ha.min(hb) - EPS
+        };
+        // Triangular pass over index pairs (both indices drive the union-find).
+        #[allow(clippy::needless_range_loop)]
+        for a in 0..n {
+            for b in (a + 1)..n {
+                if siblings(a, b) {
+                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                    if ra != rb {
+                        parent[ra] = rb;
+                    }
+                }
+            }
+        }
+        let mut by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (a, &orig) in interior.iter().enumerate() {
+            let r = find(&mut parent, a);
+            by_root.entry(r).or_default().push(orig);
+        }
+        let mut clusters = Vec::new();
+        for members in by_root.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let xs: Vec<f64> = members.iter().map(|&i| items[i].at.0).collect();
+            let mn = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if mx - mn <= EPS {
+                continue;
+            }
+            clusters.push(members);
+        }
+        clusters
+    }
+
+    /// Text keepout of a routed label of a given slot at a candidate anchor.
+    fn slot_box(&self, slot: LabelSlot, name: &str, at: Point, rot: i32) -> BBox {
+        match slot {
+            LabelSlot::Hier(_) => hier_text_box(name, at, rot),
+            _ => label_text_box(name, at, rot),
+        }
+    }
+
+    /// Try to align one cluster onto the extreme member's X. Validates every
+    /// member first and only commits when the whole group is clean; otherwise
+    /// nothing moves.
+    fn try_align_cluster(&mut self, items: &[AlignItem], cluster: &[usize]) {
+        let rot = items[cluster[0]].rot;
+        let xs = cluster.iter().map(|&i| items[i].at.0);
+        let target = if rot == 0 {
+            xs.fold(f64::NEG_INFINITY, f64::max)
+        } else {
+            xs.fold(f64::INFINITY, f64::min)
+        };
+        // Per-member feasibility + trial boxes.
+        struct Trial {
+            idx: usize,
+            new_at: Point,
+            new_box: BBox,
+            stub: Option<(usize, bool, Point, Point)>, // wire, last, fixed, old_at
+        }
+        let mut trials: Vec<Trial> = Vec::new();
+        for &i in cluster {
+            let it = &items[i];
+            let new_at = (target, it.at.1);
+            match it.kind {
+                AlignKind::Stub {
+                    wire, last, fixed, ..
+                } => {
+                    // Only ever an outward extension (target is the extreme).
+                    let old_reach = (it.at.0 - fixed.0).abs();
+                    let new_reach = (new_at.0 - fixed.0).abs();
+                    if new_reach + EPS < old_reach {
+                        return;
+                    }
+                    let new_seg = vec![fixed, new_at];
+                    let old_seg = vec![fixed, it.at];
+                    if !self.path_ok(&new_seg, &it.net, &[])
+                        || !self.parallel_clear(&new_seg, &it.net)
+                        || self.reg.foreign_crossings(&new_seg, &it.net)
+                            > self.reg.foreign_crossings(&old_seg, &it.net)
+                    {
+                        return;
+                    }
+                    trials.push(Trial {
+                        idx: i,
+                        new_at,
+                        new_box: self.slot_box(it.slot, &it.net, new_at, rot),
+                        stub: Some((wire, last, fixed, it.at)),
+                    });
+                }
+                AlignKind::Interior { lo, hi } => {
+                    if target < lo - EPS || target > hi + EPS {
+                        return;
+                    }
+                    trials.push(Trial {
+                        idx: i,
+                        new_at,
+                        new_box: self.slot_box(it.slot, &it.net, new_at, rot),
+                        stub: None,
+                    });
+                }
+            }
+        }
+        // Group-level clearance (tolerant among siblings, strict elsewhere).
+        let member_nets: BTreeSet<&str> = cluster.iter().map(|&i| items[i].net.as_str()).collect();
+        let boxes: Vec<(&str, &BBox)> = trials
+            .iter()
+            .map(|t| (items[t.idx].net.as_str(), &t.new_box))
+            .collect();
+        if !self.trial_boxes_clear(&boxes, &member_nets) {
+            return;
+        }
+        // Commit: move labels, grow the stubs, keep the registry consistent.
+        for t in &trials {
+            let it = &items[t.idx];
+            match it.slot {
+                LabelSlot::Global(i) => self.out.global_labels[i].1 = t.new_at,
+                LabelSlot::Hier(i) => self.out.hier_labels[i].2 = t.new_at,
+                LabelSlot::Net(i) => self.out.net_labels[i].1 = t.new_at,
+            }
+            if let Some((wire, last, _fixed, old_at)) = t.stub {
+                let w = &mut self.out.wires[wire];
+                let vi = if last { w.len() - 1 } else { 0 };
+                w[vi] = t.new_at;
+                // Grow the matching registry segment so later clusters see it.
+                for s in self.reg.segs.iter_mut() {
+                    if s.net != it.net || (s.y1 - s.y2).abs() >= EPS {
+                        continue;
+                    }
+                    if (s.x1 - old_at.0).abs() < EPS && (s.y1 - old_at.1).abs() < EPS {
+                        s.x1 = t.new_at.0;
+                    } else if (s.x2 - old_at.0).abs() < EPS && (s.y2 - old_at.1).abs() < EPS {
+                        s.x2 = t.new_at.0;
+                    }
+                }
+            }
+            // Refresh the label keepout in the registry (find the old box).
+            let old_box = self.slot_box(it.slot, &it.net, it.at, rot);
+            for lb in self.reg.label_boxes.iter_mut() {
+                if lb.net == it.net && boxes_collide_tol(&lb.bbox, &old_box, EPS) {
+                    lb.bbox = t.new_box;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Are the candidate label boxes clear? Bodies, foreign pins and foreign
+    /// wires are strict keepouts; label-vs-label (both foreign labels and the
+    /// cluster siblings themselves) uses the sub-grid tolerance so a tidy
+    /// two-step stack passes while a real overlap is rejected.
+    fn trial_boxes_clear(&self, boxes: &[(&str, &BBox)], member_nets: &BTreeSet<&str>) -> bool {
+        let tol = 0.5;
+        for (net, b) in boxes {
+            for p in self.model.placed.iter() {
+                let rb = raw_box(&self.design.comps[p.comp].geom, p.at, p.rotation, p.mirror);
+                if overlaps(&rb, b) {
+                    return false;
+                }
+            }
+            for (px, py, pnet) in &self.reg.pins {
+                if pnet != net
+                    && *px > b.x1 + EPS
+                    && *px < b.x2 - EPS
+                    && *py > b.y1 + EPS
+                    && *py < b.y2 - EPS
+                {
+                    return false;
+                }
+            }
+            for seg in &self.reg.segs {
+                if &seg.net != net && seg_intersects_box(seg, b) {
+                    return false;
+                }
+            }
+            for (gb, gnet) in &self.reg.power_boxes {
+                if gnet != net && overlaps(gb, b) {
+                    return false;
+                }
+            }
+            for c in &self.corridors {
+                if c.zone == CorridorZone::Corridor && &c.net != net && overlaps(&c.bbox, b) {
+                    return false;
+                }
+            }
+            for lb in &self.reg.label_boxes {
+                if member_nets.contains(lb.net.as_str()) {
+                    continue; // the moving members' own (stale) boxes
+                }
+                if boxes_collide_tol(&lb.bbox, b, tol) {
+                    return false;
+                }
+            }
+        }
+        // Siblings against each other.
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                if boxes[i].0 != boxes[j].0 && boxes_collide_tol(boxes[i].1, boxes[j].1, tol) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn compute_extents(&mut self) {
         let mut extents = self.model.content_box;
         let mut grow = |b: BBox| {
@@ -2690,6 +3186,30 @@ mod tests {
         assert!(
             over.x2 <= at.0 + 1e-6 && over.x1 < at.0,
             "text overhangs the wire"
+        );
+    }
+
+    #[test]
+    fn sibling_label_boxes_tolerate_a_two_step_stack_but_not_a_real_overlap() {
+        // The soft-alignment guard clears sibling labels aligned onto one X
+        // column when they sit two grid steps apart (their padded keepouts graze
+        // by ~0.06 mm), but rejects a real overlap: a single grid step of stacking
+        // or one label on top of another.
+        let a = label_text_box("AIN_P", (50.0, 20.0), 180);
+        let two_step = label_text_box("AIN_N", (50.0, 22.54), 180); // +2 grid steps
+        let one_step = label_text_box("AIN_N", (50.0, 21.27), 180); // +1 grid step
+        let on_top = label_text_box("AIN_N", (50.0, 20.0), 180); // same anchor
+        assert!(
+            !boxes_collide_tol(&a, &two_step, 0.5),
+            "a tidy two-step stack must pass the tolerance"
+        );
+        assert!(
+            boxes_collide_tol(&a, &one_step, 0.5),
+            "a one-step stack is a real overlap"
+        );
+        assert!(
+            boxes_collide_tol(&a, &on_top, 0.5),
+            "coincident labels collide"
         );
     }
 

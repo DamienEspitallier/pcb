@@ -44,6 +44,26 @@ pub const BOX6: &str = r#"(symbol "Box6"
             (name "GND" (effects (font (size 1.27 1.27))))
             (number "6" (effects (font (size 1.27 1.27)))))))"#;
 
+/// An IC-style box whose two right-edge pins sit only ONE grid step apart
+/// (1.27 mm), plus one left pin. Used to force a text collision when two
+/// sibling ports on those pins are pulled onto a common X column: their labels
+/// would stack a single grid step apart, a real overlap the alignment must
+/// refuse.
+pub const TIGHT_PORTS: &str = r#"(symbol "TightPorts"
+    (symbol "TightPorts_0_1"
+        (rectangle (start -5.08 5.08) (end 5.08 -5.08)
+            (stroke (width 0.254) (type default)) (fill (type background))))
+    (symbol "TightPorts_1_1"
+        (pin input line (at -7.62 0 0) (length 2.54)
+            (name "IN" (effects (font (size 1.27 1.27))))
+            (number "1" (effects (font (size 1.27 1.27)))))
+        (pin output line (at 7.62 1.27 180) (length 2.54)
+            (name "CK" (effects (font (size 1.27 1.27))))
+            (number "2" (effects (font (size 1.27 1.27)))))
+        (pin output line (at 7.62 0 180) (length 2.54)
+            (name "RST" (effects (font (size 1.27 1.27))))
+            (number "3" (effects (font (size 1.27 1.27)))))))"#;
+
 fn module_ref() -> ModuleRef {
     ModuleRef::from_path(Path::new("/test.zen"), "<root>")
 }
@@ -426,6 +446,62 @@ pub fn split_rail_ic() -> Schematic {
             .with_port(port_ref(&["U1"], "REFP"))
             .with_port(port_ref(&["U1"], "VDDPIN")),
     );
+    sch.assign_reference_designators();
+    sch
+}
+
+/// An IC `U1` whose two edges each carry a pair of single-endpoint signal
+/// ports of DIFFERENT name lengths, so their natural stub lengths differ and
+/// the boundary labels land at different X. The left edge stacks `A_LONG` over
+/// `B`, the right edge `CLK` over `PDRST` — the AD7171 CLK/PDRST pattern.
+/// Exercises the sibling-port column alignment (both edges should collapse onto
+/// one X). The sheet is otherwise empty, so alignment is always clean.
+pub fn sibling_ports_ic() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    // Pads 1..2 land on the left edge, 3..4 on the right.
+    let u1 = add_box(
+        &mut sch,
+        &["U1"],
+        &[("A_LONG", "1"), ("B", "2"), ("CLK", "3"), ("PDRST", "4")],
+    );
+    root_inst.add_child("U1".to_string(), u1);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    for (sig, pad) in [("A_LONG", 1u64), ("B", 2), ("CLK", 3), ("PDRST", 4)] {
+        sch.add_net(Net::new("Net".to_string(), sig, pad).with_port(port_ref(&["U1"], sig)));
+    }
+    sch.assign_reference_designators();
+    sch
+}
+
+/// Two single-endpoint ports (`CLK`, `PDRESET`) leave the right edge of an IC
+/// whose two right pins are only one grid step apart. Their natural stubs
+/// differ in length (different name widths), so the alignment would pull them
+/// onto one X — but that stacks their labels a single grid step apart, a real
+/// overlap. The soft pass must therefore SKIP this group, leaving the two
+/// labels at their routed (different) X.
+pub fn sibling_ports_collide() -> Schematic {
+    let module = module_ref();
+    let mut sch = Schematic::new();
+    let root = InstanceRef::new(module.clone(), vec![]);
+    let mut root_inst = Instance::module(module.clone());
+    let u1 = add_component(
+        &mut sch,
+        &["U1"],
+        TIGHT_PORTS,
+        &[("IN", "1"), ("CLK", "2"), ("PDRESET", "3")],
+        "IC",
+        None,
+    );
+    root_inst.add_child("U1".to_string(), u1);
+    sch.add_instance(root.clone(), root_inst);
+    sch.set_root_ref(root);
+    for (sig, pad) in [("IN", 1u64), ("CLK", 2), ("PDRESET", 3)] {
+        sch.add_net(Net::new("Net".to_string(), sig, pad).with_port(port_ref(&["U1"], sig)));
+    }
     sch.assign_reference_designators();
     sch
 }

@@ -62,7 +62,11 @@ pub struct SchConfig {
     /// filtered nets then run as long continuous wires across the open band and
     /// a pin-seated pull-up at the IC edge stays clear of the filter caps. A
     /// tight gap tasses the whole input against the IC (the reference AD7171
-    /// pushes its filter far to the left instead).
+    /// pushes its filter far to the left instead, with the IC well to the
+    /// right). The spread is no longer bounded by any wire-length limit — the
+    /// filtered analog wire stays continuous at any length — so this defaults
+    /// generously to match the reference layout; keep it sensible relative to
+    /// the useful content (no spread for its own sake).
     pub input_filter_gap_mm: f64,
     /// Horizontal pitch of satellite rows (decoupling caps, pulls, ...).
     pub satellite_pitch_mm: f64,
@@ -123,8 +127,28 @@ pub struct SchConfig {
     pub label_elbow_mm: f64,
     /// Clearance from an MCU OSC pin to the crystal cluster axis.
     pub crystal_gap_mm: f64,
-    /// Above this distance, two aligned pins get net labels instead of wires.
-    pub direct_wire_max_mm: f64,
+    /// Anti-absurd upper guard on the length of a single continuous wire, in
+    /// millimeters. Wire length is NOT a wire-vs-label criterion: an analog net
+    /// is wired as one continuous wire whatever its length. The decision to
+    /// wire a net rests on its class (analog -> wire; digital -> label ok), hub
+    /// membership (`hub_pin_count_threshold` / `analog_break_pin_count`) and
+    /// clean routability (no frank crossing beyond the existing cost penalty) —
+    /// never on how long the wire would be. This guard only rejects a candidate
+    /// whose length is physically nonsensical: longer than any wire could
+    /// sensibly span on the biggest supported sheet (A2 is 594x420 mm, a
+    /// Manhattan reach of ~1014 mm), where a route that long is a routing bug,
+    /// not a real net. Kept generous so it never gates a legitimate spread; set
+    /// lower only to deliberately cap the router.
+    pub wire_length_guard_mm: f64,
+    /// Local reach, in millimeters, of the orientation engine's routability
+    /// probe: at placement time a component is turned toward a group only when
+    /// one of its pins can reach that group with a wire no longer than this.
+    /// This is a placement PROXIMITY heuristic ("is the group within local
+    /// reach so the pin should face it"), NOT the wire-vs-label gate — once a
+    /// net is committed to a wire it runs at any length (`wire_length_guard_mm`).
+    /// Kept at the proven local value so orientation (and the placement it
+    /// drives) is unchanged.
+    pub orient_probe_reach_mm: f64,
     /// De-duplicate the labels of a signal net onto a single boundary port.
     /// A net must carry only ONE port/name label (the module-boundary marker):
     /// the reader should not chase the same name across two floating labels.
@@ -243,7 +267,7 @@ impl Default for SchConfig {
             col_gap_mm: 19.05,
             row_gap_mm: 15.24,
             satellite_gap_mm: 7.62,
-            input_filter_gap_mm: 38.1,
+            input_filter_gap_mm: 62.23,
             satellite_pitch_mm: 11.43,
             role_row_gap_mm: 19.05,
             pullup_pin_gap_mm: 2.54,
@@ -259,7 +283,8 @@ impl Default for SchConfig {
             align_power_by_potential: true,
             label_elbow_mm: 2.54,
             crystal_gap_mm: 8.89,
-            direct_wire_max_mm: 50.8,
+            wire_length_guard_mm: 1016.0,
+            orient_probe_reach_mm: 50.8,
             dedup_signal_labels: true,
             crossing_penalty_mm: 20.0,
             bend_penalty_mm: 5.08,
@@ -394,10 +419,22 @@ mod tests {
         assert_eq!(cfg.pullup_pin_gap_mm, 2.54);
         let pu: SchConfig = toml_str_subset("pullup-pin-gap-mm = 5.08\n");
         assert_eq!(pu.pullup_pin_gap_mm, 5.08);
-        // Input-filter spread knob, kebab-case, defaulted and overridable.
-        assert_eq!(cfg.input_filter_gap_mm, 38.1);
+        // Input-filter spread knob, kebab-case, defaulted and overridable. The
+        // default spreads the filter well off the IC (matching the reference
+        // AD7171, whose IC sits far right) now that no wire-length limit caps it.
+        assert_eq!(cfg.input_filter_gap_mm, 62.23);
         let ifg: SchConfig = toml_str_subset("input-filter-gap-mm = 25.4\n");
         assert_eq!(ifg.input_filter_gap_mm, 25.4);
+        // Wire-length guard: an anti-absurd bound, NOT a wire/label gate. Kept
+        // generous (~A2 Manhattan span) so length never breaks a continuous wire.
+        assert_eq!(cfg.wire_length_guard_mm, 1016.0);
+        let wg: SchConfig = toml_str_subset("wire-length-guard-mm = 500.0\n");
+        assert_eq!(wg.wire_length_guard_mm, 500.0);
+        // Orientation-probe reach: a placement proximity heuristic, distinct
+        // from the wire/label decision; defaulted and overridable.
+        assert_eq!(cfg.orient_probe_reach_mm, 50.8);
+        let opr: SchConfig = toml_str_subset("orient-probe-reach-mm = 38.1\n");
+        assert_eq!(opr.orient_probe_reach_mm, 38.1);
         // Relegation knobs, kebab-case, defaulted and overridable.
         assert!(cfg.relegate_utility);
         assert_eq!(cfg.utility_gap_mm, 12.7);

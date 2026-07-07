@@ -879,10 +879,11 @@ impl<'a> Engine<'a> {
         // sheet is mostly empty): the filtered nets then run as long, but still
         // continuous, wires and a pin-seated pull-up at the IC edge stays clear
         // of the filter caps. The gap is at least the room the shunt-cap row
-        // needs on the node side. It stays bounded by the router's direct-wire
-        // reach: the filter→IC wire (and its jogged sibling leg) must not exceed
-        // `direct_wire_max_mm`, or the analog net would fall back to labels —
-        // spreading further than the router can wire is counter-productive.
+        // needs on the node side. It is NO LONGER bounded by any wire-length
+        // limit: the filter→IC wire (and its jogged sibling leg) stays a
+        // continuous wire whatever its length, so the filter spreads to match
+        // the reference layout (the AD7171 pushes its filter far to the left,
+        // its IC well to the right) — bounded only by the sensible default.
         let gap = if caps.is_empty() {
             cfg.satellite_gap_mm
         } else {

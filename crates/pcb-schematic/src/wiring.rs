@@ -483,15 +483,18 @@ impl Router<'_> {
 
     /// Hard feasibility of a real-wire tree candidate, independent of foreign
     /// crossings: clean route (`path_ok` with **no** exclusion — a wire never
-    /// crosses a body, not even its own component's), length within
-    /// `direct_wire_max_mm`, no doubled wire, no SAME-net frank crossing (that
-    /// would be a missing junction) and no traversal of a foreign predicted
-    /// power corridor. Foreign crossings are electrically harmless and are
-    /// scored separately (`wire_cost`) rather than rejected here: an analog
-    /// backbone may accept one under penalty to stay continuous instead of
-    /// breaking into labels.
+    /// crosses a body, not even its own component's), no doubled wire, no
+    /// SAME-net frank crossing (that would be a missing junction) and no
+    /// traversal of a foreign predicted power corridor. Foreign crossings are
+    /// electrically harmless and are scored separately (`wire_cost`) rather than
+    /// rejected here: an analog backbone may accept one under penalty to stay
+    /// continuous instead of breaking into labels.
+    ///
+    /// Length is deliberately NOT a feasibility gate — an analog net stays one
+    /// continuous wire whatever its length. Only a physically absurd path
+    /// (beyond `wire_length_guard_mm`, a routing-bug guard) is rejected.
     pub(crate) fn tree_candidate_feasible(&self, path: &[Point], net: &str) -> bool {
-        if path_length_mm(path) > self.cfg.direct_wire_max_mm + EPS {
+        if path_length_mm(path) > self.cfg.wire_length_guard_mm + EPS {
             return false;
         }
         if !self.path_ok(path, net, &[]) {
@@ -1305,7 +1308,9 @@ impl Router<'_> {
             return false;
         }
         let manhattan = (b.pos.0 - a.pos.0).abs() + (b.pos.1 - a.pos.1).abs();
-        if manhattan > self.cfg.direct_wire_max_mm || manhattan < 1e-6 {
+        // No upper length gate: a 2-pin analog net is a wire at any length.
+        // Only reject a degenerate (coincident) or physically absurd span.
+        if manhattan > self.cfg.wire_length_guard_mm || manhattan < 1e-6 {
             return false;
         }
         let exclude = [a.placed, b.placed];
@@ -1329,6 +1334,15 @@ impl Router<'_> {
                 }
             }
             let Some(best) = best else { return false };
+            if best_crossings > 0 {
+                // A facing 2-pin net whose ONLY direct wire would frank-cross a
+                // foreign net does not route cleanly: fall back to labels rather
+                // than force a crossing wire. Length is never the reason — a
+                // crossing-free wire is emitted at any length — only the
+                // crossing is (the engineer's "a wire must not start crossing
+                // other nets" rule).
+                return false;
+            }
             router.out.wires.push(best.clone());
             router.reg.register_path(best, &name);
             true
@@ -1430,10 +1444,12 @@ impl Router<'_> {
 }
 
 /// Static probe used by the orientation engine: is one of the tree wire
-/// candidates between two pins placeable in the **static** sense — length
-/// within `direct_wire_max_mm`, no instance body traversed (no exclusion:
-/// a hook that dodges a connector by crossing its body is NOT routable),
-/// no foreign pin on the path, no foreign predicted power corridor cut?
+/// candidates between two pins placeable in the **static** sense — within the
+/// local orientation reach `orient_probe_reach_mm` (a placement proximity
+/// heuristic: a pin faces a group only when that group is within local reach,
+/// NOT the wire-vs-label gate), no instance body traversed (no exclusion: a
+/// hook that dodges a connector by crossing its body is NOT routable), no
+/// foreign pin on the path, no foreign predicted power corridor cut?
 /// Dynamic obstacles (wires/labels placed later) remain the tree's
 /// business: the probe is deliberately optimistic — enough to tell "turned
 /// toward the group" from "back to the group".
@@ -1461,7 +1477,7 @@ pub(crate) fn probe_routable(
         }
     }
     'cand: for path in tree_pair_candidates(cfg, a, b) {
-        if path_length_mm(&path) > cfg.direct_wire_max_mm + EPS {
+        if path_length_mm(&path) > cfg.orient_probe_reach_mm + EPS {
             continue;
         }
         for w in path.windows(2) {

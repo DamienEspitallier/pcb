@@ -856,7 +856,90 @@ impl<'a> Router<'a> {
     // Signals
     // --------------------------------------------------------------
 
+    /// Reserve the label lane of a design-wide single-endpoint signal net (a
+    /// boundary net that must carry a global label right off its one pin) as a
+    /// keepout, BEFORE any net is wired — but only when a neighbour pin on the
+    /// SAME component edge carries a wire-bearing (multi-endpoint) signal net
+    /// that could box this port in. A multi-endpoint analog net routed first
+    /// would otherwise run a long continuous wire straight across the boxed-in
+    /// port's only escape, forcing the port label onto that wire (a short) or
+    /// across it (a frank crossing). Reserving the lane keeps foreign wires off
+    /// it, so the neighbour net routes clear or stays on labels — the engineer's
+    /// "leave the boundary port its lane" rule, and the principled replacement
+    /// for the old length cutoff (length never gates a wire; boxing in a
+    /// stacked port's escape does). The trigger is deliberately narrow so a
+    /// port with only quiet neighbours keeps the sheet untouched.
+    fn reserve_boundary_lanes(&mut self) {
+        let half = self.cfg.grid_mm / 2.0;
+        for sn in 0..self.model.nets.len() {
+            if self.model.nets[sn].class != NetClass::Signal
+                || self.model.nets[sn].design_endpoints > 1
+            {
+                continue;
+            }
+            let name = self.model.nets[sn].name.clone();
+            let eps = self.eps_for(sn);
+            let Some(ep) = eps.first() else { continue };
+            if !self.pin_boxed_by_wiring_neighbor(ep) {
+                continue;
+            }
+            let len = label_stub_len(self.cfg, &name);
+            let (px, py) = ep.pos;
+            let bbox = if ep.dir.0.abs() > 0.5 {
+                let xe = px + ep.dir.0 * len;
+                BBox {
+                    x1: px.min(xe),
+                    y1: py - half,
+                    x2: px.max(xe),
+                    y2: py + half,
+                }
+            } else {
+                let ye = py + ep.dir.1 * len;
+                BBox {
+                    x1: px - half,
+                    y1: py.min(ye),
+                    x2: px + half,
+                    y2: py.max(ye),
+                }
+            };
+            self.reg.label_boxes.push(LabelBox {
+                bbox,
+                net: name,
+                also: Vec::new(),
+            });
+        }
+    }
+
+    /// Does a pin adjacent to `ep` on the same component (within roughly one
+    /// pin pitch) carry a DIFFERENT wire-bearing (multi-endpoint) signal net?
+    /// Such a neighbour is what boxes a single-endpoint boundary port in when it
+    /// wires as a continuous drop past the port's stacked exit.
+    fn pin_boxed_by_wiring_neighbor(&self, ep: &Endpoint) -> bool {
+        let window = 2.0 * self.cfg.grid_mm + EPS;
+        let p = &self.model.placed[ep.placed];
+        let geom = &self.design.comps[p.comp].geom;
+        for pin in geom.pins.iter().filter(|pin| !pin.hidden) {
+            let Some(pos) = geom.pin_position(&pin.number, p.at, p.rotation, p.mirror) else {
+                continue;
+            };
+            if (pos.0 - ep.pos.0).abs() < EPS && (pos.1 - ep.pos.1).abs() < EPS {
+                continue; // the port pin itself
+            }
+            if (pos.0 - ep.pos.0).abs() + (pos.1 - ep.pos.1).abs() > window {
+                continue; // not an immediate neighbour on the edge
+            }
+            if let Some(&osn) = self.model.pin_net.get(&(ep.placed, pin.number.clone()))
+                && self.model.nets[osn].class == NetClass::Signal
+                && self.model.nets[osn].design_endpoints > 1
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn route_signals(&mut self) {
+        self.reserve_boundary_lanes();
         // Port nets last: their hier-label stubs know how to stretch,
         // plain nets' elbows only have a dozen candidates near the body.
         let mut order: Vec<usize> = (0..self.model.nets.len())

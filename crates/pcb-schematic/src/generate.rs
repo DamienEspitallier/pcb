@@ -362,6 +362,43 @@ mod tests {
     }
 
     #[test]
+    fn long_analog_net_stays_a_continuous_wire() {
+        // Mission: wire LENGTH is no longer a wire-vs-label gate. Spread the
+        // input filter far off the IC (a large `input_filter_gap_mm`) so the
+        // filtered analog wire far exceeds the former ~50.8 mm direct-wire
+        // border. The analog net must stay ONE continuous wire — never break
+        // into labels for length alone (the reference AD7171 runs its AIN legs
+        // as long continuous wires with the filter pushed far to the left).
+        let mut opts = SchOptions::new("long");
+        opts.config.input_filter_gap_mm = 127.0; // ~2.5x the former length border
+        let out = generate_schematic(&analog_filter(), &opts).unwrap();
+        let c = &out.files[0].content;
+        // No length fallback logged for the analog net.
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("analog net FILT")),
+            "FILT must stay continuous despite its length; warnings: {:?}",
+            out.warnings
+        );
+        // One continuous wire named by at most one annotation label — never the
+        // multi-stub label fallback a broken net produces.
+        assert!(c.contains("(wire"), "FILT is routed with real wires");
+        assert!(
+            c.matches("(label \"FILT\"").count() <= 1,
+            "FILT is one continuous wire (<=1 label), not the label path"
+        );
+        // The wire really IS long: some segment spans well beyond the former
+        // 50.8 mm direct-wire border — proving length no longer gates.
+        let longest = wire_segments(c)
+            .iter()
+            .map(|(a, b)| (a.0 - b.0).abs() + (a.1 - b.1).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            longest > 50.8,
+            "a FILT wire segment must exceed the former 50.8 mm border (was {longest} mm)"
+        );
+    }
+
+    #[test]
     fn flat_generation_is_deterministic_and_complete() {
         let sch = divider();
         let opts = SchOptions::new("divider");
@@ -461,17 +498,18 @@ mod tests {
     }
 
     #[test]
-    fn crowded_pullup_signal_promotes_to_a_global_label() {
-        // Rule #3. A two-endpoint signal net whose IC-pin local label would be
-        // cramped — boxed in on a crowded IC edge so its only fallback collides
-        // with a neighbouring net — promotes to a self-contained global label
-        // for BOTH endpoints (the AD7171 SPI_MISO on DOUT/RDY, wedged between
-        // AIN- and its filter column). Net names are unique, so this is a pure
-        // label-style change: the connectivity is unchanged. The cramp only
-        // exists when the input filter is packed tight against the IC, so the
-        // fixture is generated with a deliberately tight `input_filter_gap_mm`
-        // (the generous default spreads the filter and uncramps the pull-up —
-        // see `spread_input_filter_uncramps_the_dout_pullup`).
+    fn tight_filter_still_dedups_the_dout_pullup() {
+        // Mission: wire LENGTH is no longer a wire-vs-label gate. Even with the
+        // input filter packed tight against the IC (a deliberately tight
+        // `input_filter_gap_mm`), the DOUT pull-up still drops across the analog
+        // input and de-duplicates onto ONE boundary port (Rule #1 — the
+        // reference AD7171 R3 -> DOUT/RDY). Previously the tight packing PLUS the
+        // old wire-length border made the clean drop unreachable, so the net
+        // fell back to a self-contained global hexagon on EACH endpoint (Rule
+        // #3, the last-resort mitigation). With the length border gone the drop
+        // is always reachable, so the fallback no longer fires — a strictly
+        // cleaner result. Net names are unique, so the label style never moves a
+        // netlist node.
         let mut opts = SchOptions::new("dout");
         opts.config.input_filter_gap_mm = 0.0;
         let out = generate_schematic(&adc_dout_congested(), &opts).unwrap();
@@ -479,42 +517,40 @@ mod tests {
         let globals = c.matches("(global_label \"MISO\"").count();
         let locals = c.matches("(label \"MISO\"").count(); // excludes "(global_label"
         assert_eq!(
-            locals, 0,
-            "the cramped DOUT signal carries no floating local label"
+            globals, 1,
+            "the DOUT net keeps ONE global boundary port (dedup), not a hexagon per endpoint"
         );
-        // Rule #1 (dedup) takes precedence when a continuous drop onto the pin
-        // is routable; here the pull-up is truly boxed in (a clean drop is
-        // impossible), so dedup rolls back and the mitigation of last resort —
-        // a self-contained global hexagon on each endpoint — still applies.
-        assert_eq!(
-            globals, 2,
-            "both MISO endpoints read as global-label hexagons instead"
+        assert_eq!(locals, 0, "no floating homonym local label survives");
+        // A single surviving label implies the other endpoint was wired (a
+        // failed join rolls back to a label per endpoint), teeing with a junction.
+        assert!(
+            c.contains("(junction"),
+            "the pull-up drop tees onto the DOUT stub with a junction"
         );
-        // Determinism guard: the promotion is stable across generations.
+        // Determinism guard: the dedup is stable across generations.
         let again = generate_schematic(&adc_dout_congested(), &opts).unwrap();
         assert_eq!(c, &again.files[0].content);
     }
 
     #[test]
-    fn spread_input_filter_uncramps_the_dout_pullup() {
-        // Mission #3. With the default (generous) input-filter spread, the ADC
+    fn spread_input_filter_keeps_the_dout_pullup_clean() {
+        // Mission #2/#3. With the default (generous) input-filter spread the ADC
         // input filter is pushed well off the IC edge and the DOUT pull-up is
-        // re-seated over its own pin: the DOUT signal is no longer boxed in, so
-        // its local label reads cleanly and Rule #3 correctly does NOT promote
-        // it. The uncramping is the intended fix — a tight filter is what
-        // triggered the global-label mitigation in the first place.
+        // re-seated over its own pin: the DOUT signal dedups onto ONE boundary
+        // port and a continuous drop — never scattering homonym labels nor
+        // promoting to a hexagon per endpoint. The spread and the removed length
+        // border both keep the drop clean.
         let out = generate_schematic(&adc_dout_congested(), &SchOptions::new("dout")).unwrap();
         let c = &out.files[0].content;
         assert_eq!(
             c.matches("(global_label \"MISO\"").count(),
-            0,
-            "the uncramped DOUT pull-up signal is not force-promoted to global"
+            1,
+            "the DOUT pull-up dedups onto one global boundary port"
         );
-        // Connectivity is unchanged: the net is still named on both endpoints.
         assert_eq!(
             c.matches("(label \"MISO\"").count(),
-            2,
-            "both MISO endpoints still carry the (now local) net label"
+            0,
+            "no homonym local labels survive the dedup"
         );
     }
 
@@ -528,10 +564,10 @@ mod tests {
         // endpoint is wired to it — one label + one continuous wire, exactly as
         // the reference AD7171 draws R3 → DOUT/RDY, not a homonym label per pin.
         // (The synthetic layout spaces the pull-up a touch further from the pin
-        // than the real part, so the drop is enabled with a wider direct-wire
-        // reach; the routing decision under test is identical.)
-        let mut opts = SchOptions::new("pu");
-        opts.config.direct_wire_max_mm = 76.2;
+        // than the real part; length is no longer a wire-vs-label gate, so the
+        // drop is enabled at the default config — the routing decision under
+        // test is identical.)
+        let opts = SchOptions::new("pu");
         let out = generate_schematic(&adc_pullup_over_analog(), &opts).unwrap();
         let c = &out.files[0].content;
         let globals = c.matches("(global_label \"MISO\"").count();

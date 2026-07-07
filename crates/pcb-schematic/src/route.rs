@@ -504,37 +504,84 @@ pub fn route_sheet(
 ) -> RoutedSheet {
     // Texts first: their boxes become keepouts for everything wired next.
     let artifacts = crate::texts::place_instance_texts(cfg, design, model, warnings);
-    let mut router = Router {
+
+    // --- Phase 1: route every net and decide the utility-band shift. Scoped so
+    // the shared `&model` borrow the router holds is released before Phase 2
+    // translates the model's relegated components. ---
+    let (out, flag_region, shift) = {
+        let mut router = Router {
+            cfg,
+            design,
+            model,
+            plan,
+            reg: Reg::new(artifacts.label_boxes),
+            out: RoutedSheet::default(),
+            warnings: &mut *warnings,
+            port_anchored: BTreeSet::new(),
+            corridors: artifacts.corridors,
+            group_wired: BTreeMap::new(),
+            collapsed: BTreeMap::new(),
+            analog_wiring: false,
+            pending_annotations: Vec::new(),
+            flag_region: None,
+        };
+        router.init_registry();
+        router.route_signals();
+        router.route_power(flag_nets);
+        router.mark_no_connects();
+        router.place_blocks();
+        router.place_port_fallbacks();
+        // Soft pass: pull sibling ports / net labels onto a shared X column.
+        // Runs after every label is placed so the shift and the zones see the
+        // final (aligned) positions.
+        router.align_sibling_ports();
+        // Slide the utility band clear of the now-final flow right edge so the
+        // horizontal zone gap and the flow-side margin have room; apply it to
+        // the routed artifacts here (the model's relegated comps follow below).
+        let shift = router.plan_band_shift();
+        if let Some((dx, seam_raw)) = shift {
+            router.apply_band_shift(dx, seam_raw);
+        }
+        (router.out, router.flag_region, shift)
+    };
+
+    // --- Phase 2: translate the band's placed components by the same `dx`, then
+    // outline the zones and compute extents against the final geometry. ---
+    if let Some((dx, _seam_raw)) = shift {
+        for p in model.placed.iter_mut() {
+            if p.relegated {
+                p.at.0 = round4(p.at.0 + dx);
+                p.bbox.x1 = round4(p.bbox.x1 + dx);
+                p.bbox.x2 = round4(p.bbox.x2 + dx);
+                p.ref_at.0 = round4(p.ref_at.0 + dx);
+                p.value_at.0 = round4(p.value_at.0 + dx);
+            }
+        }
+        // The band was the rightmost content: keep the extents base in step.
+        model.content_box.x2 = round4(model.content_box.x2 + dx);
+    }
+
+    let mut zoner = Router {
         cfg,
         design,
         model,
         plan,
-        reg: Reg::new(artifacts.label_boxes),
-        out: RoutedSheet::default(),
+        reg: Reg::new(Vec::new()),
+        out,
         warnings,
         port_anchored: BTreeSet::new(),
-        corridors: artifacts.corridors,
+        corridors: Vec::new(),
         group_wired: BTreeMap::new(),
         collapsed: BTreeMap::new(),
         analog_wiring: false,
         pending_annotations: Vec::new(),
-        flag_region: None,
+        flag_region,
     };
-    router.init_registry();
-    router.route_signals();
-    router.route_power(flag_nets);
-    router.mark_no_connects();
-    router.place_blocks();
-    router.place_port_fallbacks();
-    // Soft pass: pull sibling ports / net labels onto a shared X column. Runs
-    // after every label is placed and before the zones are outlined so the
-    // functional cell encloses the final (aligned) label positions.
-    router.align_sibling_ports();
     // Outline the functional / decoupling / ERC zones once every element
     // (including the relegated flags placed by `route_power`) is positioned.
-    router.compute_zones();
-    router.compute_extents();
-    router.out
+    zoner.compute_zones();
+    zoner.compute_extents();
+    zoner.out
 }
 
 impl<'a> Router<'a> {
@@ -2191,6 +2238,153 @@ impl<'a> Router<'a> {
             union_opt(&mut region, &power_symbol_graphic_box(&name, at, down));
         }
         self.flag_region = region;
+    }
+
+    /// Decide how far to slide the relegated utility band rightward so it
+    /// clears the functional flow by `2·zone_margin + zone_gap` — room for the
+    /// zone margin on the flow side (so a right-edge port label is inset like
+    /// the left-edge inputs), the inter-zone gap, and the margin on the band
+    /// side. Returns `(dx, seam_raw)` where `dx > 0`, or `None` when no shift
+    /// is needed. Pure read: the caller applies the translation.
+    ///
+    /// Placement reserves a fixed `utility_gap_mm` before the flow's right-side
+    /// port labels are routed and before `align_sibling_ports` nudges them onto
+    /// a shared column, so on a dense right edge the flow can grow to within a
+    /// snap step of the column — collapsing the horizontal gap and pinning the
+    /// last port label against the Functional outline.
+    fn plan_band_shift(&self) -> Option<(f64, f64)> {
+        if !self.model.relegate {
+            return None;
+        }
+        let util_left = match (self.utility_band_box(), self.flag_region) {
+            (Some(d), Some(e)) => d.x1.min(e.x1),
+            (Some(d), None) => d.x1,
+            (None, Some(e)) => e.x1,
+            (None, None) => return None,
+        };
+        let seam_raw = util_left - EPS;
+
+        // Safety gate: the band may only be translated when it is cleanly
+        // separable from the flow. A band cap reaches the flow either through a
+        // by-name net label (moves with the band, still connects by name —
+        // safe) or, on some designs, through a real wire that straddles the
+        // seam (e.g. a gate resistor tied to an IC pin). Shifting the band
+        // without that wire's far end would tear the connection, so if ANY wire
+        // has points on both sides of the seam we leave the layout untouched.
+        let seam_crossed = self.out.wires.iter().any(|w| {
+            w.iter().any(|pt| pt.0 < seam_raw) && w.iter().any(|pt| pt.0 >= seam_raw)
+        });
+        if seam_crossed {
+            return None;
+        }
+
+        // Rightmost extent of everything that stays in the flow — the same
+        // content set `compute_zones` encloses in the Functional cell.
+        let mut func_right = f64::NEG_INFINITY;
+        let mut push = |b: BBox| func_right = func_right.max(b.x2);
+        for p in &self.model.placed {
+            if !p.relegated {
+                push(placed_full_box(self.design, p));
+            }
+        }
+        for (name, at, down) in &self.out.power_symbols {
+            if at.0 < seam_raw {
+                push(power_symbol_graphic_box(name, *at, *down));
+            }
+        }
+        for &(at, rot) in &self.out.pwr_flags {
+            if at.0 < seam_raw {
+                push(pwr_flag_box(at, rot));
+            }
+        }
+        for (name, at, rot) in &self.out.net_labels {
+            if at.0 < seam_raw {
+                push(label_text_box(name, *at, *rot));
+            }
+        }
+        for (name, at, rot, _) in &self.out.global_labels {
+            if at.0 < seam_raw {
+                push(inflate(&label_text_box(name, *at, *rot), 1.27));
+            }
+        }
+        for (name, _, at, rot) in &self.out.hier_labels {
+            if at.0 < seam_raw {
+                push(hier_text_box(name, *at, *rot));
+            }
+        }
+        for w in &self.out.wires {
+            for &pt in w {
+                if pt.0 < seam_raw {
+                    push(BBox {
+                        x1: pt.0,
+                        y1: pt.1,
+                        x2: pt.0,
+                        y2: pt.1,
+                    });
+                }
+            }
+        }
+        if !func_right.is_finite() {
+            return None;
+        }
+
+        // Target clearance and the deficit to make up (snapped to the grid so
+        // every band position stays on-grid).
+        let need = 2.0 * self.cfg.zone_margin_mm + self.cfg.zone_gap_mm;
+        let dx = self.cfg.snap((need - (util_left - func_right)).max(0.0));
+        (dx > EPS).then_some((dx, seam_raw))
+    }
+
+    /// Rigidly translate the routed utility band (every artifact with `x ≥
+    /// seam`) right by `dx`. No wire crosses the seam — band caps reach the
+    /// flow only through by-name net labels — so this is a pure graphics move:
+    /// the netlist and ERC are untouched. The caller separately translates the
+    /// band's placed components (bodies + text anchors) by the same `dx`.
+    fn apply_band_shift(&mut self, dx: f64, seam_raw: f64) {
+        for (_, at, _) in self.out.power_symbols.iter_mut() {
+            if at.0 >= seam_raw {
+                at.0 = round4(at.0 + dx);
+            }
+        }
+        for (at, _) in self.out.pwr_flags.iter_mut() {
+            if at.0 >= seam_raw {
+                at.0 = round4(at.0 + dx);
+            }
+        }
+        for (_, at, _) in self.out.net_labels.iter_mut() {
+            if at.0 >= seam_raw {
+                at.0 = round4(at.0 + dx);
+            }
+        }
+        for (_, at, _, _) in self.out.global_labels.iter_mut() {
+            if at.0 >= seam_raw {
+                at.0 = round4(at.0 + dx);
+            }
+        }
+        for (_, _, at, _) in self.out.hier_labels.iter_mut() {
+            if at.0 >= seam_raw {
+                at.0 = round4(at.0 + dx);
+            }
+        }
+        for pt in self.out.no_connects.iter_mut() {
+            if pt.0 >= seam_raw {
+                pt.0 = round4(pt.0 + dx);
+            }
+        }
+        for w in self.out.wires.iter_mut() {
+            if w.iter().all(|pt| pt.0 >= seam_raw) {
+                for pt in w.iter_mut() {
+                    pt.0 = round4(pt.0 + dx);
+                }
+            }
+        }
+        // `flag_region` is a cached field consumed by `compute_zones`
+        // (`utility_band_box` recomputes from the shifted placed comps and
+        // power symbols, but this box does not).
+        if let Some(fr) = self.flag_region.as_mut() {
+            fr.x1 = round4(fr.x1 + dx);
+            fr.x2 = round4(fr.x2 + dx);
+        }
     }
 
     /// Outline the functional / decoupling / ERC areas with discreet graphic
